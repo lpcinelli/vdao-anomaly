@@ -37,11 +37,9 @@ optimizers = {'adam': Adam, 'adamax': Adamax, 'sgd': SGD}
 
 
 def train(args):
-    # print(K.tensorflow_backend._get_available_gpus())
     config = tf.ConfigProto()
     config.gpu_options.visible_device_list = ''
     K.set_session(tf.Session(config=config))
-    # print('Available GPU: {}'.format(K.tensorflow_backend._get_available_gpus()))
     print('save models and logs to dir: {}'.format(args.save_dir))
 
     # optimizer
@@ -75,8 +73,9 @@ def train(args):
                 test_subset, exclude_vids=outside_training)
             train_samples, val_samples = database.splitValidation()
 
-            train_samples = [np.concatenate((simple, aloi)) for simple, aloi \
-                in zip(train_samples, aloi_samples)]
+            if args.aloi_file is not None:
+                train_samples = [np.concatenate((simple, aloi)) for simple, \
+                    aloi in zip(train_samples, aloi_samples)]
 
             # Create model
             model = mlp.mlp(
@@ -88,7 +87,8 @@ def train(args):
                 try:
                     model = multi_gpu_model(model, gpus=2)
                 except Exception as e:
-                    print('Not possible to run on multiple GPUs\nError: {}'.format(e))
+                    print('Not possible to run on multiple GPUs\n'\
+                        'Error: {}'.format(e))
 
             # Instantiate metrics
             dis = Distance()
@@ -146,9 +146,11 @@ def train(args):
 
             for idx, meter in enumerate(results):
                 try:
-                    cross_history[layer]['test'][model.metrics_names[idx]] += [float(meter)]
+                    cross_history[layer]['test'][model.metrics_names[idx]] +=
+                        [float(meter)]
                 except:
-                    cross_history[layer]['test'][model.metrics_names[idx]] = [float(meter)]
+                    cross_history[layer]['test'][model.metrics_names[idx]] =
+                        [float(meter)]
 
             msg = ['TEST:: ']
             msg += [
@@ -177,6 +179,8 @@ def train(args):
     cross_history['config'] = vars(args)
     with open(os.path.join(args.save_dir, 'summary.json'), 'w') as fp:
         json.dump(cross_history, fp, sort_keys=True, indent=4)
+    with open('summary.pkl', 'wb') as fp:
+        pickle.dump(cross_history, fp, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 if __name__ == '__main__':
@@ -231,10 +235,6 @@ if __name__ == '__main__':
         type=float,
         metavar='N',
         help='Val set relative to train size (ratio)')
-    # tr_parser.add_argument(
-    #     '--aloi',
-    #     action='store_true',
-    #     help='Adds ALOI-augmented data to training')
     tr_parser.add_argument(
         '--test-file',
         type=str,
@@ -253,7 +253,7 @@ if __name__ == '__main__':
         '--aloi-file',
         type=str,
         metavar='PATH',
-        default='train_batch_ALOI.h5',
+        default=None,
         help='Path to ALOI-augmented imgs file'
     )
     # Architecture parameters
