@@ -43,6 +43,194 @@ def _tp_tn_fp_fn(y_true, y_pred):
         _fp(y_true, y_pred), _fn(y_true, y_pred)
 
 
+def _fpr(fp, tn, eps=EPS):
+    return fp / (fp + tn + eps)
+
+
+def _fnr(fn, tp, eps=EPS):
+    return fn / (fn + tp + eps)
+
+
+def _tpr(fn, tp, eps=EPS):
+    return 1 - _fnr(fn, tp, eps)
+
+
+def _tnr(fp, tn, eps=EPS):
+    return 1 - _fpr(fp, tn, eps)
+
+
+def _fbeta(fp, fn, tp, beta2):
+    return (1 + beta2) * tp / ((1 + beta2) * tp + beta2 * fn + fp + eps)
+
+
+def _distance(fnr, fpr):
+    return K.sqrt(K.square(fnr) + K.square(fpr))
+
+
+def fpr(y_pred, y_true, threshold=0.5, eps=EPS):
+    y_true, y_pred = _sanitize(y_true, y_pred, threshold=threshold)
+    fp = _fp(y_pred, y_true)
+    tn = _tn(y_pred, y_true)
+    return _fpr(fp, tn)
+
+
+def fnr(y_pred, y_true, threshold=0.5, eps=EPS):
+    y_true, y_pred = _sanitize(y_true, y_pred, threshold=threshold)
+    fn = _fn(y_pred, y_true)
+    tp = _tp(y_pred, y_true)
+    return _fnr(tn, tp, eps)
+
+
+def tpr(y_pred, y_true, threshold=0.5, eps=EPS):
+    return 1 - fnr(y_pred, y_true, threshold, eps)
+
+
+def tnr(y_pred, y_true, threshold=0.5, eps=EPS):
+    return 1 - fpr(y_pred, y_true, threshold, eps)
+
+
+def fbeta(y_pred, y_true, beta=1, threshold=0.5, eps=EPS):
+    y_true, y_pred = _sanitize(y_true, y_pred, threshold=threshold)
+    fn = _fn(y_pred, y_true)
+    tp = _tp(y_pred, y_true)
+    fp = _fp(y_pred, y_true)
+    beta2 = beta ** 2
+    return _fbeta(fp, fn, tp, beta2, eps=eps)
+
+
+def f1(y_pred, y_true,  threshold=0.5, eps=EPS):
+    return fbeta(y_pred, y_true, beta=1, threshold=threshold, eps=eps)
+
+
+def distance(y_pred, y_true, threshold=0.5, eps=EPS):
+    y_true, y_pred = _sanitize(y_true, y_pred, threshold=threshold)
+    tp, tn, fp, fn = _tp_tn_fp_fn(y_pred, y_true)
+    fnr = _fnr(fn, tp, eps=eps)
+    fpr = _fpr(fp, tn, eps=eps)
+    return _distance(fnr, fpr)
+
+
+def accuracy(y_true, y_pred, threshold=0.5, eps=EPS):
+    y_true, y_pred = _sanitize(y_true, y_pred, threshold=threshold)
+    return K.mean(K.equal(y_true, y_pred))
+
+
+def compose(metrics, results, threshold=0.5, eps=EPS):
+    """ Computes all specified metrics on results for each desired
+    threshold value
+    Args:
+        metrics (list):
+        results (tuple): (y_pred, y_true) either tf Tensor or ndarray
+        threshold (int/tuple): list of values at each y_pred should be binarized
+        eps: minimum value to avoid zero division error
+    Returns:
+        list of results at each given threshold
+        Example: [((metric1, @thrs1), (metric1, @thrs2), (metric1, @thrs3)),
+                  ((metric2, @thrs1), (metric2, @thrs2), (metric2, @thrs3))]
+    """
+    meter = []
+    y_pred, y_true = results
+    if not isinstance(threshold, (tuple, list)):
+        threshold = (threshold,)
+
+    n = len(threshold)
+    for metric, thres in product(metrics, threshold):
+        meter += [metric(y_pred, y_true, threshold=thres, eps=eps)]
+    return list(zip(*[iter(meter)] * n))
+
+
+class TruePos(Layer):
+    """ Computes TP globally
+    """
+
+    def __init__(self, threshold=0.5, eps=EPS):
+        super(TruePos, self).__init__(name='dis')
+        self.stateful = True
+        self.threshold = threshold
+        self.tp = K.variable(0, dtype='float32')
+
+    def reset_states(self):
+        K.set_value(self.tp, 0)
+
+    def __call__(self, y_true, y_pred):
+        y_true, y_pred = _sanitize(y_true, y_pred, self.threshold)
+        true_pos = _tp(y_true, y_pred)
+
+        self.add_update(K.update_add(self.tp, true_pos),
+                        inputs=[y_true, y_pred])
+
+        return self.true_pos
+
+
+class TrueNeg(Layer):
+    """ Computes TN globally
+    """
+
+    def __init__(self, threshold=0.5, eps=EPS):
+        super(TrueNeg, self).__init__(name='dis')
+        self.stateful = True
+        self.threshold = threshold
+        self.tn = K.variable(0, dtype='float32')
+
+    def reset_states(self):
+        K.set_value(self.tn, 0)
+
+    def __call__(self, y_true, y_pred):
+        y_true, y_pred = _sanitize(y_true, y_pred, self.threshold)
+        true_neg = _tn(y_true, y_pred)
+
+        self.add_update(K.update_add(self.tn, true_neg),
+                        inputs=[y_true, y_pred])
+
+        return self.true_neg
+
+
+class FalsePos(Layer):
+    """ Computes FP globally
+    """
+
+    def __init__(self, threshold=0.5, eps=EPS):
+        super(FalsePos, self).__init__(name='dis')
+        self.stateful = True
+        self.threshold = threshold
+        self.fp = K.variable(0, dtype='float32')
+
+    def reset_states(self):
+        K.set_value(self.fp, 0)
+
+    def __call__(self, y_true, y_pred):
+        y_true, y_pred = _sanitize(y_true, y_pred, self.threshold)
+        false_pos = _fp(y_true, y_pred)
+
+        self.add_update(K.update_add(self.fp, false_pos),
+                        inputs=[y_true, y_pred])
+
+        return self.fp
+
+
+class FalseNeg(Layer):
+    """ Computes FN globally
+    """
+
+    def __init__(self, threshold=0.5, eps=EPS):
+        super(Distance, self).__init__(name='dis')
+        self.stateful = True
+        self.threshold = threshold
+        self.fn = K.variable(0, dtype='float32')
+
+    def reset_states(self):
+        K.set_value(self.fn, 0)
+
+    def __call__(self, y_true, y_pred):
+        y_true, y_pred = _sanitize(y_true, y_pred, self.threshold)
+        false_neg = _fn(y_true, y_pred)
+
+        self.add_update(K.update_add(self.fn, false_neg),
+                        inputs=[y_true, y_pred])
+
+        return self.fp
+
+
 class FalsePosRate(Layer):
     """ Computes FPR globally
     """
@@ -69,7 +257,7 @@ class FalsePosRate(Layer):
         self.add_update(K.update_add(self.tn, true_neg),
                         inputs=[y_true, y_pred])
 
-        return self.fp / (self.fp + self.tn + self.eps)
+        return _fpr(self.fp, self.tn, eps=self.eps)
 
 
 class FalseNegRate(Layer):
@@ -98,7 +286,7 @@ class FalseNegRate(Layer):
         self.add_update(K.update_add(self.fn, false_neg),
                         inputs=[y_true, y_pred])
 
-        return self.fn / (self.fn + self.tp + self.eps)
+        return _fnr(self.fn, self.tp, eps=self.eps)
 
 
 class FBetaScore(Layer):
@@ -133,8 +321,7 @@ class FBetaScore(Layer):
         self.add_update(K.update_add(self.fp, false_pos),
                         inputs=[y_true, y_pred])
 
-        return (1 + self.beta2) * self.tp / \
-            ((1 + self.beta2) * self.tp + self.beta2 * self.fn + self.fp + self.eps)
+        return _fbeta(self.fp, self.fn, self.tp, self.beta2, eps=self.eps)
 
 
 class Distance(Layer):
