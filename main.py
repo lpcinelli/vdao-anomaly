@@ -8,8 +8,9 @@ from keras import backend as K
 from keras import callbacks
 from keras.optimizers import SGD, Adam, Adamax
 from keras.utils import multi_gpu_model
+
 import datasets.hdf5_vdao as vdao
-from metrics import Distance, FalseNegRate, FalsePosRate, FBetaScore
+import metrics
 from archs import mlp
 
 # BLOCOS DE TESTE -- Como nao e possivel treinar com os mesmo objetos do teste, foram feitos
@@ -36,6 +37,27 @@ LAYER_NAME = [
 optimizers = {'adam': Adam, 'adamax': Adamax, 'sgd': SGD}
 
 
+# # shuffle(X, y, groups) here doesn't do much, just scrambles within splits
+# import numpy as np
+# from sklearn.model_selection import GroupKFold
+# X = np.arange(59)
+# # X = np.array([[1, 2], [3, 4], [5, 6], [7, 8], [9, 0], [11, 12]])
+# y = np.arange(59)
+# groups = np.asarray(T59VIDS_OBJS_LST)
+# group_kfold = GroupKFold(n_splits=5)
+# group_kfold.get_n_splits(X, y, groups)
+# seen_test = []
+# print(group_kfold)
+# for train_index, test_index in group_kfold.split(X, y, groups):
+#     print("TRAIN:", train_index, "\nTEST:", test_index)
+#     X_train, X_test = groups[train_index], groups[test_index]
+#     print("\nTRAIN:", X_train, "\nTEST:", X_test)
+#     print("\nTRAIN SIZE: {}\tTEST SIZE:{}\n\n".format(len(X_train), len(X_test)))
+#     seen_test += [test_index]
+# print()
+# print("total dif objs seen on test:",len(set([idx for sublist in seen_test for idx in sublist])))
+
+
 def train(args):
     config = tf.ConfigProto()
     config.gpu_options.visible_device_list = ''
@@ -54,12 +76,18 @@ def train(args):
     database = vdao.VDAO(args.dataset_dir, args.train_file, args.test_file,
         val_ratio=args.val_ratio, aloi_file=args.aloi_file)
 
+    # Useful metrics to record
+    metrics_list = [metrics.fnr, metrics.fpr, metrics.dis, metrics.f1,
+        metrics.tp, metrics.tn, metrics.fp, metrics.fn]
+    metrics_names = [metric.__name__ for metric in metrics_list]
+
     cross_history = {}
     for layer in LAYER_NAME:
         seen_vids = []
         database.set_layer(layer)
         aloi_samples = database.loadData(mode='aloi')
         cross_history[layer] = {'train': {}, 'val': {}, 'test': {}}
+        roc = metrics.ROC(distance, op='min')
 
         for test_idx, test_subset in enumerate(VDAO_TEST_ENTRIES_OBJ_NB):
 
@@ -90,17 +118,15 @@ def train(args):
                     print('Not possible to run on multiple GPUs\n'\
                         'Error: {}'.format(e))
 
-            # Instantiate metrics
-            dis = Distance()
-            fnr = FalseNegRate()
-            fpr = FalsePosRate()
-            f1 = FBetaScore(beta=1)
-
             # Glue everything together
             model.compile(
                 loss='binary_crossentropy',
                 optimizer=optimizer,
-                metrics=['accuracy', fnr, fpr, dis, f1])
+                metrics=['accuracy',
+                         metrics.FalseNegRate(),
+                         metrics.FalsePosRate(),
+                         metrics.Distance(),
+                         metrics.FBetaScore(beta=1)])
 
             if not os.path.exists(layer_path):
                 os.makedirs(layer_path)
@@ -128,7 +154,7 @@ def train(args):
                 test_idx+1, len(VDAO_TEST_ENTRIES_OBJ_NB)))
 
             for name, meter in history.history.items():
-                # should I log the highes or the latest value here? (stdout)
+                # should I log the highest or the latest value here? (stdout)
                 try:
                     mode = 'val' if name.startswith('val') else 'train'
                     name = name.split('_')[-1]
@@ -136,23 +162,60 @@ def train(args):
                 except KeyError:
                     cross_history[layer][mode][name] = [float(meter[-1])]
 
-            # Evaluate on TEST set
-            results = model.evaluate(
-                x=test_samples[0],
-                y=test_samples[1],
+            probas_ = model.predict_proba(
+                val_samples[0],
                 batch_size=args.batch_size,
-                verbose=0,
-                sample_weight=None)
+                verbose=0)
 
-            for idx, meter in enumerate(results):
+            # Compute ROC curve and find thresold that minimizes dist
+            best_threshold, best_dist = roc(val_samples[1], probas_)
+
+            # Evaluate on VAL set (threshold @ 50%. @ `best_threshold`)
+            thres_vals = [0.5, best_threshold]
+            meters_val = metrics.compose(metrics_list,
+                (probas_, val_samples[1]), thres_vals)
+
+            cross_history[layer]['val']['thresholds'] = thres_vals
+            for idx, meters in enumerate(meters_test):
                 try:
-                    cross_history[layer]['test'][model.metrics_names[idx]] +=
-                        [float(meter)]
+                    cross_history[layer]['val']['pp_' + \
+                        metrics_names[idx]] +=
+                            [float(meter[0]) for meter in meters]
                 except:
-                    cross_history[layer]['test'][model.metrics_names[idx]] =
-                        [float(meter)]
+                    cross_history[layer]['val']['pp_' + \
+                        metrics_names[idx]] =
+                            [float(meter[0]) for meter in meters]
 
-            msg = ['TEST:: ']
+            # Print validation results w/ thresholds other than 0.5
+            msg = ['VAL:: {}'.format(thres_vals[1:]))]
+            msg += [
+                '{0}: {1}  '.format(
+                    name, meter[-1][1:]) for name, meter in
+                cross_history[layer]['val'].items()
+            ]
+            print(''.join(msg))
+
+            # DOUBT: Does model.evaluate update stateful metric's states?
+            probas_ = model.predict_proba(
+                test_samples[0],
+                batch_size=args.batch_size,
+                verbose=0)
+
+            # Evaluate on TEST set (threshold @ 50%. @ `best_threshold`)
+            meters_test = metrics.compose(metrics_list,
+                (probas_, test_samples[1]), thres_vals)
+
+            cross_history[layer]['test']['thresholds'] = thres_vals
+            for idx, meters in enumerate(meters_test):
+                try:
+                    cross_history[layer]['test'][metrics_names[idx]] +=
+                        [float(meter[0]) for meter in meters]
+                except:
+                    cross_history[layer]['test'][metrics_names[idx]] =
+                        [float(meter[0]) for meter in meters]
+
+            # Print test results w/ all thresholds
+            msg = ['TEST:: {}'.format(thres_vals))]
             msg += [
                 '{0}: {1}  '.format(
                     name, meter[-1]) for name, meter in
@@ -160,21 +223,36 @@ def train(args):
             ]
             print(''.join(msg))
 
-
         for mode, history in cross_history[layer].items():
             for name, meter in history.items():
-                cross_history[layer][mode][name] += ['avg: {}'.format(
-                    np.asarray(meter).mean())]
+                cross_history[layer][mode][name] += [
+                    np.asarray(meter).mean(axis=0)]
 
+        cross_history[layer]['val']['roc']['interp_tprs']['mean'],
+            cross_history[layer]['roc']['auc']['mean'] = roc.mean()
+        cross_history[layer]['val']['roc']['interp_tprs']['std'],
+            cross_history[layer]['roc']['auc']['std'] = roc.mean()
+
+        roc.plot(os.path.join(layer_path,'roc-crossval.eps'))
+
+        # Print layer avg results @50% and @`best_threshold`
         msg = ['\nLAYER: {}  -->  '.format(layer)]
         msg += [
-            '{0}: {1}  '.format(
-                name, meter[-1].split()[-1][:6]) for name, meter in
-            cross_history[layer]['test'].items()
+            '{0}: '.format(name) + ('{:.4f}  '*int(len(meter[-1]))).format(
+                *meter[-1]) for name, meter in
+                    cross_history[layer]['test'].items()
         ]
         print(''.join(msg))
         print('\n' + '* ' * 80 + '\n\n')
 
+    # Plot mean ROC curve for each layer
+    for layer, info in cross_history.items():
+        plt.plot(roc.mean_fpr, info['val']['roc']['interp_tprs']['mean'],
+            lw=1, alpha=0.3, label='ROC - {} (AUC = %0.2f)'.format(
+                layer.split('_')[0], info['val']['roc']['auc']['mean']))
+    roc.label_plot()
+
+    # saving quick access summary w/ results
     del args.func
     cross_history['config'] = vars(args)
     with open(os.path.join(args.save_dir, 'summary.json'), 'w') as fp:
@@ -249,12 +327,17 @@ if __name__ == '__main__':
         default='train_batch_VDAO.h5',
         help='Path to train file',
     )
+    # tr_parser.add_argument(
+    #     '--aloi',
+    #     action='store_true',
+    #     help='Adds ALOI-augmented data to training')
     tr_parser.add_argument(
         '--aloi-file',
         type=str,
         metavar='PATH',
         default=None,
         help='Path to ALOI-augmented imgs file'
+        # 'train_batch_ALOI.h5'
     )
     # Architecture parameters
     tr_parser.add_argument(
