@@ -1,12 +1,12 @@
 from itertools import product
 
 import matplotlib.pyplot as plt
-from scipy import interp
-from sklearn.metrics import auc, roc_curve
-
+import numpy as np
 import tensorflow as tf
 from keras import backend as K
 from keras.layers import Layer
+from scipy import interp
+from sklearn.metrics import auc, roc_curve
 
 EPS = 1e-8
 
@@ -18,27 +18,27 @@ def _sanitize(y_true, y_pred, threshold, typecast='float32'):
 
 
 def _tn(y_true, y_pred, typecast='float32'):
-    good_preds = K.cast(K.equal(y_pred, y_true), typecast)
+    good_preds = K.cast(K.equal(y_true, y_pred), typecast)
     true_neg = K.cast(
         K.sum(good_preds * K.cast(K.equal(y_true, 0), typecast)), typecast)
     return true_neg
 
 
 def _tp(y_true, y_pred, typecast='float32'):
-    good_preds = K.cast(K.equal(y_pred, y_true), typecast)
+    good_preds = K.cast(K.equal(y_true, y_pred), typecast)
     true_pos = K.cast(K.sum(good_preds * y_true), typecast)
     return true_pos
 
 
 def _fp(y_true, y_pred, typecast='float32'):
-    bad_preds = K.cast(tf.logical_not(K.equal(y_pred, y_true)), typecast)
+    bad_preds = K.cast(tf.logical_not(K.equal(y_true, y_pred)), typecast)
     false_pos = K.cast(
         K.sum(bad_preds * K.cast(K.equal(y_true, 0), typecast)), typecast)
     return false_pos
 
 
 def _fn(y_true, y_pred, typecast='float32'):
-    bad_preds = K.cast(tf.logical_not(K.equal(y_pred, y_true)), typecast)
+    bad_preds = K.cast(tf.logical_not(K.equal(y_true, y_pred)), typecast)
     false_neg = K.cast(K.sum(bad_preds * y_true), typecast)
     return false_neg
 
@@ -72,44 +72,68 @@ def _distance(fnr, fpr):
     return K.sqrt(K.square(fnr) + K.square(fpr))
 
 
-def fpr(y_pred, y_true, threshold=0.5, eps=EPS):
+def tp(y_true, y_pred, threshold=0.5, eps=None):
     y_true, y_pred = _sanitize(y_true, y_pred, threshold=threshold)
-    fp = _fp(y_pred, y_true)
-    tn = _tn(y_pred, y_true)
-    return _fpr(fp, tn)
+    return _tp(y_true, y_pred)
 
 
-def fnr(y_pred, y_true, threshold=0.5, eps=EPS):
+def tn(y_true, y_pred, threshold=0.5, eps=None):
     y_true, y_pred = _sanitize(y_true, y_pred, threshold=threshold)
-    fn = _fn(y_pred, y_true)
-    tp = _tp(y_pred, y_true)
-    return _fnr(tn, tp, eps)
+    return _tn(y_true, y_pred)
 
 
-def tpr(y_pred, y_true, threshold=0.5, eps=EPS):
-    return 1 - fnr(y_pred, y_true, threshold, eps)
-
-
-def tnr(y_pred, y_true, threshold=0.5, eps=EPS):
-    return 1 - fpr(y_pred, y_true, threshold, eps)
-
-
-def fbeta(y_pred, y_true, beta=1, threshold=0.5, eps=EPS):
+def fp(y_true, y_pred, threshold=0.5, eps=None):
     y_true, y_pred = _sanitize(y_true, y_pred, threshold=threshold)
-    fn = _fn(y_pred, y_true)
-    tp = _tp(y_pred, y_true)
-    fp = _fp(y_pred, y_true)
+    return _fp(y_true, y_pred)
+
+
+def fn(y_true, y_pred, threshold=0.5, eps=None):
+    y_true, y_pred = _sanitize(y_true, y_pred, threshold=threshold)
+    return _fn(y_true, y_pred)
+
+
+def fpr(y_true, y_pred, threshold=0.5, eps=EPS):
+    y_true, y_pred = _sanitize(y_true, y_pred, threshold=threshold)
+    fp = _fp(y_true, y_pred)
+    tn = _tn(y_true, y_pred)
+    return fp / (fp + tn + eps)
+    # return _fpr(fp, tn)
+
+
+def fnr(y_true, y_pred, threshold=0.5, eps=EPS):
+    y_true, y_pred = _sanitize(y_true, y_pred, threshold=threshold)
+    fn = _fn(y_true, y_pred)
+    tp = _tp(y_true, y_pred)
+    return fn / (fn + tp + eps)
+    # return _fnr(fn, tp, eps)
+
+
+def tpr(y_true, y_pred, threshold=0.5, eps=EPS):
+    return 1 - fnr(y_true, y_pred, threshold, eps)
+
+
+def tnr(y_true, y_pred, threshold=0.5, eps=EPS):
+    return 1 - fpr(y_true, y_pred, threshold, eps)
+
+
+def fbeta(y_true, y_pred, beta=1, threshold=0.5, eps=EPS):
+    y_true, y_pred = _sanitize(y_true, y_pred, threshold=threshold)
+    fn = _fn(y_true, y_pred)
+    tp = _tp(y_true, y_pred)
+    fp = _fp(y_true, y_pred)
     beta2 = beta**2
     return _fbeta(fp, fn, tp, beta2, eps=eps)
 
 
-def f1(y_pred, y_true, threshold=0.5, eps=EPS):
-    return fbeta(y_pred, y_true, beta=1, threshold=threshold, eps=eps)
+def f1(y_true, y_pred, threshold=0.5, eps=EPS):
+    return fbeta(y_true, y_pred, beta=1, threshold=threshold, eps=eps)
 
 
-def distance(y_pred, y_true, threshold=0.5, eps=EPS):
+def distance(y_true, y_pred, threshold=0.5, eps=EPS):
     y_true, y_pred = _sanitize(y_true, y_pred, threshold=threshold)
-    tp, tn, fp, fn = _tp_tn_fp_fn(y_pred, y_true)
+    tp, tn, fp, fn = _tp_tn_fp_fn(y_true, y_pred)
+    # fnr = fn / (fn + tp + eps)
+    # fpr = return fp / (fp + tn + eps)
     fnr = _fnr(fn, tp, eps=eps)
     fpr = _fpr(fp, tn, eps=eps)
     return _distance(fnr, fpr)
@@ -125,7 +149,7 @@ def compose(metrics, results, threshold=0.5, eps=EPS):
     threshold value
     Args:
         metrics (list):
-        results (tuple): (y_pred, y_true) either tf Tensor or ndarray
+        results (tuple): (y_true, y_pred) either tf Tensor or ndarray
         threshold (int/tuple): list of values at each y_pred should be binarized
         eps: minimum value to avoid zero division error
     Returns:
@@ -134,13 +158,14 @@ def compose(metrics, results, threshold=0.5, eps=EPS):
                   ((metric2, @thrs1), (metric2, @thrs2), (metric2, @thrs3))]
     """
     meter = []
-    y_pred, y_true = results
+    y_true, y_pred = results
     if not isinstance(threshold, (tuple, list)):
         threshold = (threshold, )
 
     n = len(threshold)
     for metric, thres in product(metrics, threshold):
-        meter += [metric(y_pred, y_true, threshold=thres, eps=eps)]
+        meter += [metric(y_true, y_pred, threshold=thres, eps=eps)]
+    meter = K.get_session().run(meter)
     return list(zip(*[iter(meter)] * n))
 
 
@@ -149,7 +174,7 @@ class TruePos(Layer):
     """
 
     def __init__(self, threshold=0.5, eps=EPS):
-        super(TruePos, self).__init__(name='dis')
+        super(TruePos, self).__init__(name='tp')
         self.stateful = True
         self.threshold = threshold
         self.tp = K.variable(0, dtype='float32')
@@ -164,7 +189,7 @@ class TruePos(Layer):
         self.add_update(
             K.update_add(self.tp, true_pos), inputs=[y_true, y_pred])
 
-        return self.true_pos
+        return self.tp
 
 
 class TrueNeg(Layer):
@@ -172,7 +197,7 @@ class TrueNeg(Layer):
     """
 
     def __init__(self, threshold=0.5, eps=EPS):
-        super(TrueNeg, self).__init__(name='dis')
+        super(TrueNeg, self).__init__(name='tn')
         self.stateful = True
         self.threshold = threshold
         self.tn = K.variable(0, dtype='float32')
@@ -187,7 +212,7 @@ class TrueNeg(Layer):
         self.add_update(
             K.update_add(self.tn, true_neg), inputs=[y_true, y_pred])
 
-        return self.true_neg
+        return self.tn
 
 
 class FalsePos(Layer):
@@ -195,7 +220,7 @@ class FalsePos(Layer):
     """
 
     def __init__(self, threshold=0.5, eps=EPS):
-        super(FalsePos, self).__init__(name='dis')
+        super(FalsePos, self).__init__(name='fp')
         self.stateful = True
         self.threshold = threshold
         self.fp = K.variable(0, dtype='float32')
@@ -218,7 +243,7 @@ class FalseNeg(Layer):
     """
 
     def __init__(self, threshold=0.5, eps=EPS):
-        super(FalseNeg, self).__init__(name='dis')
+        super(FalseNeg, self).__init__(name='fn')
         self.stateful = True
         self.threshold = threshold
         self.fn = K.variable(0, dtype='float32')
@@ -233,7 +258,7 @@ class FalseNeg(Layer):
         self.add_update(
             K.update_add(self.fn, false_neg), inputs=[y_true, y_pred])
 
-        return self.fp
+        return self.fn
 
 
 class FalsePosRate(Layer):
@@ -262,7 +287,8 @@ class FalsePosRate(Layer):
         self.add_update(
             K.update_add(self.tn, true_neg), inputs=[y_true, y_pred])
 
-        return _fpr(self.fp, self.tn, eps=self.eps)
+        return self.fp / (self.fp + self.tn + self.eps)
+        # return _fpr(self.fp, self.tn, eps=self.eps)
 
 
 class FalseNegRate(Layer):
@@ -291,7 +317,8 @@ class FalseNegRate(Layer):
         self.add_update(
             K.update_add(self.fn, false_neg), inputs=[y_true, y_pred])
 
-        return _fnr(self.fn, self.tp, eps=self.eps)
+        return self.fn / (self.fn + self.tp + self.eps)
+        # return _fnr(self.fn, self.tp, eps=self.eps)
 
 
 class FBetaScore(Layer):
@@ -374,7 +401,7 @@ class ROC(object):
         Returns the optimal threshold for the specified metric
     """
 
-    def __init__(self, metric=distance, op='max'):
+    def __init__(self):
         self.inter_tprs = []
         self.tprs = []
         self.fprs = []
@@ -383,23 +410,25 @@ class ROC(object):
         self.mean_auc = None
         self.std_tpr = None
         self.std_auc = None
-        self.func = metric
-        self.argcmp = np.argmax if op == 'max' else np.argmin
+        # self.func = metric
+        # self.argcmp = K.argmin
         self.mean_fpr = np.linspace(0, 1, 100)
 
     def __call__(self, y_true, proba):
         fpr, tpr, thresholds = roc_curve(y_true, proba)
-        self.inter_tprs.append(interp(mean_fpr, fpr, tpr))
+        self.inter_tprs.append(interp(self.mean_fpr, fpr, tpr))
         self.tprs.append(tpr)
         self.fprs.append(fpr)
 
         self.inter_tprs[-1][0] = 0.0
         roc_auc = auc(fpr, tpr)
         self.aucs.append(roc_auc)
-        dist = self.func(tpr, fpr)
-        idx = self.argcmp(dist)
+        # dist = K.get_session().run(self.func(1-tpr, fpr))
+        dist = K.get_session().run(_distance(1-tpr, fpr))
+        # dist =  np.sqrt(np.square(1 - tpr) + np.square(fpr))
+        idx = np.argmin(dist)
 
-        return self.inter_tprs[-1][idx], dist[idx]
+        return thresholds[idx], dist[idx]
 
     def _mean(self):
         self.mean_tpr = np.mean(self.inter_tprs, axis=0)
@@ -424,11 +453,6 @@ class ROC(object):
         mean_tpr, mean_auc = self.mean()
         std_tpr, std_auc = self.std()
 
-        plt.plot(self.mean_fpr, mean_tpr, color='b',
-                label=r'ROC média (AUC = %0.2f $\pm$ %0.2f)' % \
-                    (mean_auc, std_auc),
-                lw=2, alpha=.8)
-
         if std == True:
             for i, (fpr, tpr) in enumerate(zip(self.fprs, self.tprs)):
                 plt.plot(
@@ -447,12 +471,20 @@ class ROC(object):
                 alpha=.2,
                 label=r'$\pm$ 1 std. dev.')
 
+        plt.plot(self.mean_fpr, mean_tpr, color='b',
+                 label=r'ROC média (AUC = %0.2f $\pm$ %0.2f)' %
+                 (mean_auc, std_auc),
+                 lw=2, alpha=.8)
+        plt.plot([0, 1], [0, 1], linestyle='--', lw=1,
+                 color='r', label='Identidade', alpha=.8)
+
         self.label_plot()
         if '.' not in filename:
             filename += '.eps'
         plt.savefig(filename, bbox_inches='tight')
+        plt.close()
 
-    def label_plot():
+    def label_plot(self):
         plt.xlim([-0.05, 1.05])
         plt.ylim([-0.05, 1.05])
         plt.xlabel('Taxa de Falso Positivo')

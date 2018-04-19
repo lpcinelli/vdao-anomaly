@@ -1,35 +1,36 @@
 import argparse
+import glob
 import json
 import os
+import pdb
+import pickle
 
+import matplotlib as mpl
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+
+import datasets.hdf5_vdao as vdao
+import keras
+import metrics
 import tensorflow as tf
+import utils
+from archs import mlp
 from keras import backend as K
 from keras import callbacks
 from keras.optimizers import SGD, Adam, Adamax
 from keras.utils import multi_gpu_model
 
-import datasets.hdf5_vdao as vdao
-import metrics
-from archs import mlp
+mpl.use('Agg')
 
-# BLOCOS DE TESTE -- Como nao e possivel treinar com os mesmo objetos do teste, foram feitos
-# blocos de teste, onde a rede e treinada com todos os objetos exceto os que estao no bloco
-# (Ex: Bloco de teste [0,2,5,6] - treino com [1,3,4,7,8,9,10,11])
-VDAO_TEST_ENTRIES_OBJ_NB = [[0, 2, 5, 6], [1, 3, 4, 8], [7, 9, 12, 13], [
-    10, 11, 14, 19
-], [15, 16, 20, 22], [17, 21, 24, 29], [18, 28, 33, 38], [23, 25, 40, 41], [
-    26, 27, 34, 39
-], [30, 35, 36, 46], [31, 37, 43, 49], [32, 42, 44, 47], [45, 50, 52, 56],
-    [48, 51, 54, 55], [53, 56, 8, 10],
-    [57, 11, 18, 24], [58, 13, 23, 46]]
-
-# Nomes das camadas onde foram extraidos os mapas de features
 LAYER_NAME = [
     'res2a', 'res2b', 'res2c', 'res3a', 'res3b', 'res3c', 'res3d', 'res4a',
     'res4b', 'res4c', 'res4d', 'res4e', 'res4f', 'res5a', 'res5b', 'res5c',
     'avg_pool'
 ]
+# LAYER_NAME = [
+#     'res2a',
+# ]
 LAYER_NAME = [
     name + '_branch2a' for name in LAYER_NAME if name.startswith('res')
 ]
@@ -37,25 +38,68 @@ LAYER_NAME = [
 optimizers = {'adam': Adam, 'adamax': Adamax, 'sgd': SGD}
 
 
-# # shuffle(X, y, groups) here doesn't do much, just scrambles within splits
-# import numpy as np
-# from sklearn.model_selection import GroupKFold
-# X = np.arange(59)
-# # X = np.array([[1, 2], [3, 4], [5, 6], [7, 8], [9, 0], [11, 12]])
-# y = np.arange(59)
-# groups = np.asarray(T59VIDS_OBJS_LST)
-# group_kfold = GroupKFold(n_splits=5)
-# group_kfold.get_n_splits(X, y, groups)
-# seen_test = []
-# print(group_kfold)
-# for train_index, test_index in group_kfold.split(X, y, groups):
-#     print("TRAIN:", train_index, "\nTEST:", test_index)
-#     X_train, X_test = groups[train_index], groups[test_index]
-#     print("\nTRAIN:", X_train, "\nTEST:", X_test)
-#     print("\nTRAIN SIZE: {}\tTEST SIZE:{}\n\n".format(len(X_train), len(X_test)))
-#     seen_test += [test_index]
-# print()
-# print("total dif objs seen on test:",len(set([idx for sublist in seen_test for idx in sublist])))
+def predict(args):
+    config = tf.ConfigProto()
+    config.gpu_options.visible_device_list = ''
+    K.set_session(tf.Session(config=config))
+    print('save results: {}'.format(args.save_dir))
+
+    # Setting dataset helper
+    database = vdao.VDAO(args.dataset_dir, args.train_file, args.test_file)
+
+    # Useful metrics to record
+    metrics_list = [metrics.fnr, metrics.fpr, metrics.distance, metrics.f1,
+                    metrics.tp, metrics.tn, metrics.fp, metrics.fn]
+    metrics_names = [metric.__name__ for metric in metrics_list]
+
+    cross_avgs = {}
+    cross_best = {}
+    for layer in LAYER_NAME:
+        database.set_layer(layer)
+        cross_avgs[layer] = {}
+        test_sizes = []
+        meters_test = []
+        thres_vals = np.arange(0.01, 1.0, 0.01)
+
+        for test_idx, (_, _, test_samples, test_size) \
+                in enumerate(database.load_generator(val_set=False)):
+            test_sizes.append(test_size)
+
+            model_name = os.path.join(
+                args.model_path, layer, 'model.test{:02d}-ep'.format(test_idx))
+            model_name = glob.glob(model_name + '*')[-1]
+            model = keras.models.load_model(model_name, compile=False)
+
+            if args.multi_gpu:
+                try:
+                    model = multi_gpu_model(model)
+                except Exception as e:
+                    print('Not possible to run on multiple GPUs\n'
+                          'Error: {}'.format(e))
+
+            # DOUBT: Does model.evaluate update stateful metric's states?
+            probas_ = model.predict_proba(
+                test_samples[0],
+                batch_size=args.batch_size,
+                verbose=0).squeeze()
+
+            meters_test += [metrics.compose(metrics_list,
+                                            (test_samples[1], probas_),
+                                            thres_vals.tolist())]
+
+        df = pd.DataFrame(meters_test, columns=metrics_names)
+        for col in df.columns:
+            cross_avgs[layer][col] = np.average(np.stack(df[col]),
+                                                weights=test_sizes, axis=0)
+
+        best_idx = np.argmin(cross_avgs[layer]['distance'])
+
+        cross_best[layer] = {name: meter[best_idx] for name,
+                             meter in cross_avgs[layer].items()}
+        cross_best[layer]['threshold'] = thres_vals[best_idx]
+        print(cross_best)
+
+    utils.save_data({'all': cross_avgs, 'best': cross_best}, args.save_dir)
 
 
 def train(args):
@@ -74,36 +118,40 @@ def train(args):
 
     # Setting dataset helper
     database = vdao.VDAO(args.dataset_dir, args.train_file, args.test_file,
-        val_ratio=args.val_ratio, aloi_file=args.aloi_file)
+                         val_ratio=args.val_ratio, aloi_file=args.aloi_file)
 
     # Useful metrics to record
-    metrics_list = [metrics.fnr, metrics.fpr, metrics.dis, metrics.f1,
-        metrics.tp, metrics.tn, metrics.fp, metrics.fn]
+    metrics_list = [metrics.fnr, metrics.fpr, metrics.distance, metrics.f1,
+                    metrics.tp, metrics.tn, metrics.fp, metrics.fn]
     metrics_names = [metric.__name__ for metric in metrics_list]
 
     cross_history = {}
     for layer in LAYER_NAME:
-        seen_vids = []
+        # seen_vids = []
+        test_sizes = []
         database.set_layer(layer)
-        aloi_samples = database.loadData(mode='aloi')
+        # aloi_samples = database.load_data(mode='aloi')
         cross_history[layer] = {'train': {}, 'val': {}, 'test': {}}
-        roc = metrics.ROC(distance, op='min')
+        roc = metrics.ROC()
+        layer_path = os.path.join(args.save_dir, layer)
 
-        for test_idx, test_subset in enumerate(VDAO_TEST_ENTRIES_OBJ_NB):
+        for test_idx, (train_samples, val_samples, test_samples, test_size) \
+                in enumerate(database.load_generator()):
+            # for test_idx, test_subset in enumerate(VDAO_TEST_ENTRIES_OBJ_NB):
 
-            layer_path = os.path.join(args.save_dir, layer)
+            # outside_training = [vid for vid in test_subset if vid in seen_vids]
+            # seen_vids += test_subset
 
-            outside_training = [vid for vid in test_subset if vid in seen_vids]
-            seen_vids += test_subset
+            # # Load data
+            # train_samples, test_samples = database.load_data(
+            #     test_subset, exclude_vids=outside_training)
+            # train_samples, val_samples = database.split_validation(mode='video')
 
-            # Load data
-            train_samples, test_samples = database.loadData(
-                test_subset, exclude_vids=outside_training)
-            train_samples, val_samples = database.splitValidation()
+            # if args.aloi_file is not None:
+            #     train_samples = tuple(np.concatenate((simple, aloi)) for simple, \
+            #         aloi in zip(train_samples, aloi_samples))
 
-            if args.aloi_file is not None:
-                train_samples = [np.concatenate((simple, aloi)) for simple, \
-                    aloi in zip(train_samples, aloi_samples)]
+            test_sizes.append(test_size)
 
             # Create model
             model = mlp.mlp(
@@ -113,10 +161,10 @@ def train(args):
 
             if args.multi_gpu:
                 try:
-                    model = multi_gpu_model(model, gpus=2)
+                    model = multi_gpu_model(model)
                 except Exception as e:
-                    print('Not possible to run on multiple GPUs\n'\
-                        'Error: {}'.format(e))
+                    print('Not possible to run on multiple GPUs\n'
+                          'Error: {}'.format(e))
 
             # Glue everything together
             model.compile(
@@ -126,7 +174,11 @@ def train(args):
                          metrics.FalseNegRate(),
                          metrics.FalsePosRate(),
                          metrics.Distance(),
-                         metrics.FBetaScore(beta=1)])
+                         metrics.FBetaScore(beta=1),
+                         metrics.TruePos(),
+                         metrics.TrueNeg(),
+                         metrics.FalsePos(),
+                         metrics.FalseNeg()])
 
             if not os.path.exists(layer_path):
                 os.makedirs(layer_path)
@@ -150,8 +202,7 @@ def train(args):
                 callbacks=[lr_scheduler, csv_logger, checkpointer],
                 validation_data=val_samples)
 
-            print('\nFinished training {}/{}'.format(
-                test_idx+1, len(VDAO_TEST_ENTRIES_OBJ_NB)))
+            print('\nFinished training {}'.format(test_idx+1))
 
             for name, meter in history.history.items():
                 # should I log the highest or the latest value here? (stdout)
@@ -165,7 +216,7 @@ def train(args):
             probas_ = model.predict_proba(
                 val_samples[0],
                 batch_size=args.batch_size,
-                verbose=0)
+                verbose=0).squeeze()
 
             # Compute ROC curve and find thresold that minimizes dist
             best_threshold, best_dist = roc(val_samples[1], probas_)
@@ -173,25 +224,23 @@ def train(args):
             # Evaluate on VAL set (threshold @ 50%. @ `best_threshold`)
             thres_vals = [0.5, best_threshold]
             meters_val = metrics.compose(metrics_list,
-                (probas_, val_samples[1]), thres_vals)
+                                         (val_samples[1], probas_), thres_vals)
 
-            cross_history[layer]['val']['thresholds'] = thres_vals
-            for idx, meters in enumerate(meters_test):
+            for name, meters in zip(metrics_names, meters_val):
                 try:
-                    cross_history[layer]['val']['pp_' + \
-                        metrics_names[idx]] +=
-                            [float(meter[0]) for meter in meters]
+                    cross_history[layer]['val']['pp_' + name] += [[
+                        float(meter) for meter in meters]]
                 except:
-                    cross_history[layer]['val']['pp_' + \
-                        metrics_names[idx]] =
-                            [float(meter[0]) for meter in meters]
+                    cross_history[layer]['val']['pp_' + name] = [[
+                        float(meter) for meter in meters]]
 
             # Print validation results w/ thresholds other than 0.5
-            msg = ['VAL:: {}'.format(thres_vals[1:]))]
+            msg = ['VAL:: thresholds @ {}\n'.format(thres_vals[1:])]
             msg += [
-                '{0}: {1}  '.format(
-                    name, meter[-1][1:]) for name, meter in
-                cross_history[layer]['val'].items()
+                '{0}: {1}  \n'.format(
+                    name, meter[-1][1:] if isinstance(meter[-1], (list, tuple))
+                    else meter[-1]) for name, meter in
+                cross_history[layer]['val'].items() if name is not 'thresholds'
             ]
             print(''.join(msg))
 
@@ -199,66 +248,86 @@ def train(args):
             probas_ = model.predict_proba(
                 test_samples[0],
                 batch_size=args.batch_size,
-                verbose=0)
+                verbose=0).squeeze()
 
             # Evaluate on TEST set (threshold @ 50%. @ `best_threshold`)
             meters_test = metrics.compose(metrics_list,
-                (probas_, test_samples[1]), thres_vals)
+                                          (test_samples[1], probas_), thres_vals)
 
-            cross_history[layer]['test']['thresholds'] = thres_vals
-            for idx, meters in enumerate(meters_test):
+            for name, meters in zip(metrics_names, meters_test):
                 try:
-                    cross_history[layer]['test'][metrics_names[idx]] +=
-                        [float(meter[0]) for meter in meters]
+                    cross_history[layer]['test'][name] += [[
+                        float(meter) for meter in meters]]
                 except:
-                    cross_history[layer]['test'][metrics_names[idx]] =
-                        [float(meter[0]) for meter in meters]
+                    cross_history[layer]['test'][name] = [[
+                        float(meter) for meter in meters]]
 
             # Print test results w/ all thresholds
-            msg = ['TEST:: {}'.format(thres_vals))]
+            msg = ['\nTEST:: thresholds @ {}\n'.format(thres_vals)]
             msg += [
-                '{0}: {1}  '.format(
+                '{0}: {1}  \n'.format(
                     name, meter[-1]) for name, meter in
-                cross_history[layer]['test'].items()
+                cross_history[layer]['test'].items() if name is not 'thresholds'
             ]
             print(''.join(msg))
 
+            thres_vals = [[float(thres) for thres in thres_vals]]
+            for mode in ['val', 'test']:
+                try:
+                    cross_history[layer][mode]['thresholds'] += thres_vals
+                except:
+                    cross_history[layer][mode]['thresholds'] = thres_vals
+
         for mode, history in cross_history[layer].items():
             for name, meter in history.items():
+                if name is 'thresholds':
+                    continue
                 cross_history[layer][mode][name] += [
-                    np.asarray(meter).mean(axis=0)]
+                    np.average(meter, weights=test_sizes, axis=0).astype(
+                        'float64').tolist()]
 
-        cross_history[layer]['val']['roc']['interp_tprs']['mean'],
-            cross_history[layer]['roc']['auc']['mean'] = roc.mean()
-        cross_history[layer]['val']['roc']['interp_tprs']['std'],
-            cross_history[layer]['roc']['auc']['std'] = roc.mean()
+        cross_history[layer]['test']['nb_vids'] = test_sizes
 
-        roc.plot(os.path.join(layer_path,'roc-crossval.eps'))
+        mean_tpr, mean_auc = [meter.astype(
+            'float64').tolist() for meter in roc.mean()]
+        std_tpr, std_auc = [meter.astype('float64').tolist()
+                            for meter in roc.std()]
+        cross_history[layer]['val']['roc'] = {
+            'interp_tprs-mean': mean_tpr,
+            'auc-mean': mean_auc,
+            'interp_tprs-std': std_tpr,
+            'auc-std': std_auc}
+        roc.plot(os.path.join(layer_path, 'roc-crossval.eps'))
 
         # Print layer avg results @50% and @`best_threshold`
-        msg = ['\nLAYER: {}  -->  '.format(layer)]
+        msg = ['\nLAYER: {} :: thresholds @ {}\n'.format(layer,
+                                                         cross_history[layer]['test']['thresholds'])]
         msg += [
-            '{0}: '.format(name) + ('{:.4f}  '*int(len(meter[-1]))).format(
+            '| {0}: '.format(name) + ('{:.4f}  '*int(len(meter[-1]))).format(
                 *meter[-1]) for name, meter in
-                    cross_history[layer]['test'].items()
+            cross_history[layer]['test'].items() if name not in ['thresholds', 'nb_vids']
         ]
         print(''.join(msg))
         print('\n' + '* ' * 80 + '\n\n')
 
     # Plot mean ROC curve for each layer
     for layer, info in cross_history.items():
-        plt.plot(roc.mean_fpr, info['val']['roc']['interp_tprs']['mean'],
-            lw=1, alpha=0.3, label='ROC - {} (AUC = %0.2f)'.format(
-                layer.split('_')[0], info['val']['roc']['auc']['mean']))
+        auc_mean = info['val']['roc']['auc-mean']
+        auc_std = info['val']['roc']['auc-std']
+        plt.plot(roc.mean_fpr, info['val']['roc']['interp_tprs-mean'],
+                 lw=2, alpha=0.8, label=r'ROC - {} (AUC = {:.2f} $\pm$ {:0.2f})'.format(
+            layer.split('_')[0], auc_mean, auc_std))
+    plt.plot([0, 1], [0, 1], linestyle='--', lw=1,
+             color='r', label='Identidade', alpha=.8)
     roc.label_plot()
+    plt.savefig(os.path.join(args.save_dir, 'mean-roc.eps'))
+    plt.close()
 
     # saving quick access summary w/ results
     del args.func
     cross_history['config'] = vars(args)
-    with open(os.path.join(args.save_dir, 'summary.json'), 'w') as fp:
-        json.dump(cross_history, fp, sort_keys=True, indent=4)
-    with open('summary.pkl', 'wb') as fp:
-        pickle.dump(cross_history, fp, protocol=pickle.HIGHEST_PROTOCOL)
+
+    utils.save_data(cross_history, os.path.join(args.save_dir, 'summary'))
 
 
 if __name__ == '__main__':
@@ -291,16 +360,16 @@ if __name__ == '__main__':
         '--multiple-gpu',
         action='store_true',
         help='Run on several GPUs if available')
-
-    # Train parser
-    tr_parser = subparsers.add_parser('train', help='Network training')
-
-    tr_parser.add_argument(
+    parser.add_argument(
         '--save',
         dest='save_dir',
         type=str,
         default='models/',
-        help='name of the saved model')
+        help='path to save results to')
+
+    # Train parser
+    tr_parser = subparsers.add_parser('train', help='Network training')
+
     tr_parser.add_argument(
         '--epochs',
         default=20,
@@ -327,10 +396,6 @@ if __name__ == '__main__':
         default='train_batch_VDAO.h5',
         help='Path to train file',
     )
-    # tr_parser.add_argument(
-    #     '--aloi',
-    #     action='store_true',
-    #     help='Adds ALOI-augmented data to training')
     tr_parser.add_argument(
         '--aloi-file',
         type=str,
@@ -381,6 +446,31 @@ if __name__ == '__main__':
         metavar='W',
         help='weight decay (default: 0)')
     tr_parser.set_defaults(func=train)
+
+    # Predict parser
+    pred_parser = subparsers.add_parser('predict', help='Network training')
+
+    pred_parser.add_argument(
+        '--test-file',
+        type=str,
+        metavar='PATH',
+        default='59_videos_test_batch.h5',
+        help='Path to test file')
+
+    pred_parser.add_argument(
+        '--train-file',
+        type=str,
+        metavar='PATH',
+        default='train_batch_VDAO.h5',
+        help='Path to train file')
+    pred_parser.add_argument(
+        '--load',
+        dest='model_path',
+        type=str,
+        metavar='PATH',
+        help='Path to trained model dir')
+
+    pred_parser.set_defaults(func=predict)
 
     args = parser.parse_args()
     print(args)
