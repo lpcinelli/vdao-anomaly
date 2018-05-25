@@ -1,21 +1,30 @@
 import os
-from itertools import product as iterprod
+from itertools import product
+import json
 
 import h5py
 import numpy as np
-from sklearn.model_selection import train_test_split, GroupKFold
+import sklearn.model_selection
+from sklearn.model_selection import train_test_split, GroupKFold, LeavePGroupsOut, LeaveOneGroupOut, GroupShuffleSplit
+
+LAYER_NAME = [
+    'res2a', 'res2b', 'res2c', 'res3a', 'res3b', 'res3c', 'res3d', 'res4a',
+    'res4b', 'res4c', 'res4d', 'res4e', 'res4f', 'res5a', 'res5b', 'res5c',
+]
+LAYER_NAME = [
+    name + '_branch2a' for name in LAYER_NAME if name.startswith('res')
+]
 
 # BLOCOS DE TESTE -- Como nao e possivel treinar com os mesmo objetos do teste, foram feitos
 # blocos de teste, onde a rede e treinada com todos os objetos exceto os que estao no bloco
 # (Ex: Bloco de teste [0,2,5,6] - treino com [1,3,4,7,8,9,10,11])
-VDAO_TEST_ENTRIES_OBJ_NB = [[0, 2, 5, 6], [1, 3, 4, 8], [7, 9, 12, 13], [
+VDAO_TEST_ENTRIES = [[0, 2, 5, 6], [1, 3, 4, 8], [7, 9, 12, 13], [
     10, 11, 14, 19
 ], [15, 16, 20, 22], [17, 21, 24, 29], [18, 28, 33, 38], [23, 25, 40, 41], [
     26, 27, 34, 39
 ], [30, 35, 36, 46], [31, 37, 43, 49], [32, 42, 44, 47], [45, 50, 52, 56],
     [48, 51, 54, 55], [53, 56, 8, 10],
     [57, 11, 18, 24], [58, 13, 23, 46]]
-# VDAO_TEST_ENTRIES_OBJ_NB = [[0, 2, 5, 6], [1, 3, 4, 8], [7, 9, 12, 13]]
 
 # Specifies which object appears in each one of the 59 vids (in order)
 VIDS_OBJS = [['Dark-Blue_Box'] * 2, ['Shoe'], ['Camera_Box'], [
@@ -30,133 +39,197 @@ VIDS_OBJS = [['Dark-Blue_Box'] * 2, ['Shoe'], ['Camera_Box'], [
 
 VIDS_OBJS = [item for sublist in VIDS_OBJS for item in sublist]
 
-VDAO_DATABASE_LIGHTING_ENTRIES = ['NORMAL-Light', 'EXTRA-Light']
+VDAO_ILLU = ['NORMAL-Light', 'EXTRA-Light']
 
-VDAO_DATABASE_OBJECT_ENTRIES = list(set([
-    name for name in VIDS_OBJS
-])) + ['Mult_Objs1', 'Mult_Objs2', 'Mult_Objs3']
+VDAO_OBJS = set([
+    name for name in VIDS_OBJS + ['Mult_Objs1', 'Mult_Objs2', 'Mult_Objs3']
+])
 
-VDAO_DATABASE_OBJECT_POSITION_ENTRIES = ['POS1', 'POS2', 'POS3']
+VDAO_POS = ['POS1', 'POS2', 'POS3']
 
-# path do HDF5
-# nomes dos arquivos HDF5
-# HDF5_SRC = '/home/bruno.afonso/datasets/article_HDF5'
-# HDF5_TEST = '59_videos_test_batch.h5'
-# HDF5_TRAIN = 'train_batch_VDAO.h5'
+
+class ManualGroupSplit(object):
+    """ Manually defines a cross-validation group split specified by a .json
+    file containing. Compatibility class due to Bruno's group partitioning.
+    """
+
+    def __init__(self, filename=None, n_splits=None):
+        """
+        Keyword Arguments:
+            filename {string} -- Path to file containing the splits and their videos (default: {None})
+            n_splits {int} -- Number of different groups to consider (default: {None})
+
+        Raises:
+            ValueError -- Incorret number of splits requested (max: 17)
+        """
+        if not filename.endswith('.json'):
+            filename += '.json'
+        with open(filename, 'r') as fp:
+            self.test_folds = json.load(fp)
+
+        self.nb_groups = n_splits or len(self.test_folds)
+        if self.nb_groups > len(self.test_folds):
+            raise ValueError('n_splits should be not greater than {}'.format(
+                len(self.test_folds)))
+
+    def split(self, X, y, groups):
+        seen_vids = []
+        for test_idx in self.test_folds[:self.nb_groups]:
+
+            test_groups = [groups[idx] for idx in test_idx]
+            train_idx = [idx for idx, obj in enumerate(
+                groups) if obj not in test_groups]
+
+            test_idx = [idx for idx in test_idx if idx not in seen_vids]
+            seen_vids += test_idx
+
+            yield train_idx, test_idx
+
+
+group_fetching = {'k_fold': GroupKFold,
+                  'leave_p_out': LeavePGroupsOut,
+                  'leave_one_out': LeaveOneGroupOut,
+                  'shuffle_split': GroupShuffleSplit,
+                  'manual': ManualGroupSplit
+                  }
 
 
 class VDAO(object):
-    def __init__(self, dataset_dir, train_file, test_file, val_ratio=0, aloi_file=None):
-        self.dataset_dir = dataset_dir
-        self.train_file = train_file
-        self.test_file = test_file
-        self.aloi_file = aloi_file
-        self._reset_data()
-        self.train_entries = list(iterprod(
-            VDAO_DATABASE_LIGHTING_ENTRIES,
-            VDAO_DATABASE_OBJECT_ENTRIES,
-            VDAO_DATABASE_OBJECT_POSITION_ENTRIES))
+    """[summary]
 
+    Arguments:
+        object {[type]} -- [description]
+
+    Raises:
+        ValueError -- [description]
+        ValueError -- [description]
+        ValueError -- [description]
+
+    Returns:
+        [type] -- [description]
+    """
+
+    def __init__(self, dataset_dir, filename, val_ratio=0,
+                 aloi_file=None, val_set=True, mode='train'):
+        """[summary]
+
+        Arguments:
+            dataset_dir {[type]} -- [description]
+            filename {[type]} -- [description]
+
+        Keyword Arguments:
+            val_ratio {int} -- [description] (default: {0})
+            aloi_file {[type]} -- [description] (default: {None})
+            val_set {bool} -- [description] (default: {True})
+            mode {str} -- [description] (default: {'train'})
+        """
+
+        self.dataset_dir = dataset_dir
+        self.files = {mode: filename, 'aloi': aloi_file}
+        self.data = {mode: None, 'aloi': None}
+        if mode == 'train':
+            self.data['val'] = None
+
+        self.train_entries = list(product(VDAO_ILLU, VDAO_OBJS, VDAO_POS))
         self.val_ratio = val_ratio
+        self.val_set = val_set
+        self.mode = mode
 
     def set_layer(self, layer_name):
-        self._reset_data()
-
+        self.data = {key: None for key in self.data.keys()}
         self.out_layer = layer_name
 
-    def _reset_data(self):
-        self.out_layer = None
-        self.train_data, self.aloi_data = [None] * 2
-        self.val_data, self.test_data = [None] * 2
+    def load_generator(self,
+                       method='leave_one_out',
+                       inner_kwargs=None,
+                       **kwargs):
+        """[summary]
 
-    def load_generator(self, n_splits=5, val_set=True):
+        Keyword Arguments:
+            method {str} -- [description] (default: {'leave_one_out'})
+            inner_kwargs {[type]} -- [description] (default: {None})
+        """
+
         x = np.arange(len(VIDS_OBJS))
-        group_kfold = GroupKFold(n_splits=n_splits)
-        self.load_data(mode='aloi')
+        fold_method = group_fetching[method](**kwargs)
+        mode = inner_kwargs.pop('mode', 'video')
 
-        for train_vid_idx, test_vid_idx in group_kfold.split(x, x, VIDS_OBJS):
+        if mode == 'aloi' and self.files['aloi'] is not None:
+            self.data['aloi'], aloi_size = _loadFile(
+                    os.path.join(self.dataset_dir, self.files['aloi']),
+                    self.out_layer, [''])
+
+        for train_vid_idx, test_vid_idx in fold_method.split(x, x, VIDS_OBJS):
             test_objs = [VIDS_OBJS[vid] for vid in test_vid_idx]
             test_vids = [['video{}'.format(vid+1)] for vid in test_vid_idx]
-            train_vids = [
-                k for k in self.train_entries if k[1] not in test_objs]
+            train_vids = list(product(VDAO_ILLU, set(
+                [VIDS_OBJS[idx] for idx in train_vid_idx]), VDAO_POS))
 
-            self.test_data = _loadFile(
-                os.path.join(self.dataset_dir, self.test_file),
-                self.out_layer, test_vids)
+            if self.mode == 'test':
+                self.data['test'], test_size = _loadFile(
+                    os.path.join(self.dataset_dir, self.files['test']),
+                    self.out_layer, test_vids)
+                yield self.data['test'], {'test': test_size}
 
-            if val_set is True:
-                train_vids, val_vids = self.split_validation(mode='video',
-                                                             data=train_vids,
-                                                             random_state=0)
-                self.val_data = _loadFile(
-                    os.path.join(self.dataset_dir, self.train_file),
-                    self.out_layer, val_vids, test_objs)
+            else:
+                self.data['val'], val_size = None, 0
+                if self.val_set is True:
+                    train_vids, val_vids = self.split_validation(
+                        mode=mode, data=train_vids, groups=train_vid_idx,
+                        random_state=0, **inner_kwargs)
 
-            self.train_data = _loadFile(
-                os.path.join(self.dataset_dir, self.train_file),
-                self.out_layer, train_vids, test_objs)
+                    self.data['val'], val_size = _loadFile(
+                        os.path.join(self.dataset_dir, self.files['train']),
+                        self.out_layer, val_vids, test_objs)
 
-            yield _merge_datasets((self.train_data,
-                                   self.aloi_data)), \
-                self.val_data, self.test_data, len(test_vid_idx)
+                self.data['train'], train_size = _loadFile(
+                    os.path.join(self.dataset_dir, self.files['train']),
+                    self.out_layer, train_vids, test_objs)
 
-    def load_data(self, test_vids=[], mode='simple', exclude_vids=[], verbose=1):
-        if mode == 'aloi':
-            if self.aloi_file is None:
-                print('HDF5 for aloi-augmented data not set')
-                return
-            if verbose > 0:
-                print('LOADING ALOI VIDEOS\nLAYER: {}\n'.format(self.out_layer))
-            self.aloi_data = _loadFile(
-                os.path.join(self.dataset_dir, self.aloi_file),
-                self.out_layer, [''])
+                yield (_merge_datasets((self.data['train'], self.data['aloi'])),
+                       self.data['val']), {'train': train_size, 'val': val_size}
 
-            return self.aloi_data
 
-        elif mode in ['simple', 'vdao-only', 'original']:
-            # get which objects appear in the chosen test set
-            if len(test_vids) == 0:
-                raise ValueError('No test vid specified')
+    def split_validation(self,
+                         mode='frame',
+                         ratio=None,
+                         data=None,
+                         labels=None,
+                         random_state=None,
+                         groups=None,
+                         **kwargs):
+        """[summary]
 
-            test_objs = [VIDS_OBJS[vid] for vid in test_vids]
-            if verbose > 0:
-                print('LOADING DATA\nLAYER: {}\nTEST VIDEOS: {}\n'
-                      'TEST OBJS: {}\nEXCLUDE REPEATED: {}\n'.format(
-                          self.out_layer, test_vids, test_objs, exclude_vids))
+        Keyword Arguments:
+            mode {str} -- [description] (default: {'frame'})
+            ratio {[type]} -- [description] (default: {None})
+            data {[type]} -- [description] (default: {None})
+            labels {[type]} -- [description] (default: {None})
+            random_state {[type]} -- [description] (default: {None})
+            groups {[type]} -- [description] (default: {None})
 
-            test_vids = [['video{}'.format(vid+1)]
-                         for vid in test_vids if vid not in exclude_vids]
+        Raises:
+            ValueError -- [description]
 
-            # load test batches
-            self.test_data = _loadFile(
-                os.path.join(self.dataset_dir, self.test_file),
-                self.out_layer, test_vids)
+        Returns:
+            [type] -- [description]
+        """
 
-            # load train batches
-            self.train_data = _loadFile(
-                os.path.join(self.dataset_dir, self.train_file),
-                self.out_layer, self.train_entries, test_objs)
-
-            return self.train_data, self.test_data
-
-    def split_validation(self, mode='frame', ratio=None, data=None, labels=None, random_state=None):
         extra_data = None
         if ratio is None:
             ratio = self.val_ratio
 
-        if mode is 'frame':
+        if mode == 'frame':
             if data is None:
-                data, labels = self.train_data
-                extra_data = self.aloi_data
+                data, labels = self.data['train']
+                extra_data = self.data['aloi']
 
             x_train, x_val, y_train, y_val = train_test_split(
                 data, labels, stratify=labels, test_size=ratio, random_state=random_state)
             train_data = x_train, y_train
-            val_data = x_val, y_val
+            return _merge_datasets((train_data, extra_data)), (x_val, y_val)
 
-            return _merge_datasets((train_data, extra_data)), val_data
-
-        elif mode is 'video':
+        if mode == 'video':
             if data is None:
                 data = np.asarray(self.train_entries)
 
@@ -165,24 +238,59 @@ class VDAO(object):
 
             if labels is None:
                 return x_train, x_val
-        else:
-            raise ValueError('mode should be either \'frame\' or \'video\'')
+
+        try:
+            raise NotImplementedError
+            if data is None:
+                data = np.asarray(self.train_entries)
+
+            split_method = getattr(sklearn.model_selection, mode)
+            split_method = split_method(**kwargs)
+            train_index, val_index = next(
+                split_method.split(data, data, groups))
+            return data[train_index], data[val_index]
+
+        except AttributeError:
+            raise ValueError('invalid mode \'{}\' chosen'.format(mode))
 
 
 def _merge_datasets(datasets):
     """ Merge (concatenates along samples dimension) together datasets
-        (data, label).
-    Args:
-        datasets (list): Contains (data, label) elements to be merged together
+    (data, label).
+
+    Arguments:
+        datasets {list} -- Contains (data, label) elements to be merged together
+
     Returns:
-        A single dataset tuple (data, label) consisting of all input datasets
+        {tuple} A single dataset tuple (data, label) consisting of all input datasets
         in the same exact order.
     """
     return tuple(np.concatenate(data) for data in zip(*tuple(filter(None, datasets))))
 
 
 def _loadFile(basepath, out_layer, vid_name_iter, exceptions=[], verbose=1):
-    """ Loads the speciied set on 'basepath' ....
+    """Loads data from within the HDF5 file specified by 'basepath' relative
+    to the feature maps of the videos 'vid_name_iter' obtained from layer
+    'out_layer'. It's possible to consider forbidden substrigs defined by
+    'exceptions' such that any data whose path contains such substrings is not
+    loaded.
+
+    Arguments:
+        basepath {string} -- [description]
+        out_layer {string} -- [description]
+        vid_name_iter {iterable} -- [description]
+
+    Keyword Arguments:
+        exceptions {list} -- [description] (default: {[]})
+        verbose {int} -- [description] (default: {1})
+
+    Raises:
+        NameError -- [description]
+        exception -- [description]
+
+    Returns:
+        nd.array -- data
+        nd.array -- labels
     """
     if 'train' in basepath:
         mode = 'train'
@@ -214,9 +322,10 @@ def _loadFile(basepath, out_layer, vid_name_iter, exceptions=[], verbose=1):
             if mode is 'test':
                 raise exception
 
+    set_size = [vid_labels.shape[0] for vid_labels in labels]
     data = np.concatenate(data)
     labels = np.concatenate(labels).astype(int)
 
     h5_file.close()
 
-    return data, labels
+    return (data, labels), set_size

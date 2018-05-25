@@ -6,70 +6,89 @@ import pdb
 import pickle
 
 import matplotlib as mpl
+mpl.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+import archs
 import datasets.hdf5_vdao as vdao
 import keras
 import metrics
 import tensorflow as tf
 import utils
-from archs import mlp
+from datasets.hdf5_vdao import LAYER_NAME
 from keras import backend as K
 from keras import callbacks
 from keras.optimizers import SGD, Adam, Adamax
 from keras.utils import multi_gpu_model
 
-mpl.use('Agg')
-
-LAYER_NAME = [
-    'res2a', 'res2b', 'res2c', 'res3a', 'res3b', 'res3c', 'res3d', 'res4a',
-    'res4b', 'res4c', 'res4d', 'res4e', 'res4f', 'res5a', 'res5b', 'res5c',
-    'avg_pool'
-]
-# LAYER_NAME = [
-#     'res2a',
-# ]
-LAYER_NAME = [
-    name + '_branch2a' for name in LAYER_NAME if name.startswith('res')
-]
+import pdb
 
 optimizers = {'adam': Adam, 'adamax': Adamax, 'sgd': SGD}
 
+arch_names = sorted(name for name in archs.__dict__
+                    if name.islower() and not name.startswith("__")
+                    and callable(archs.__dict__[name]))
 
-def predict(args):
+
+def _common(args, func, **kwargs):
+    mode = 'train' if func.__name__ == '_train' else 'test'
+    if mode == 'test':
+        # Instatiate dataloader
+        validation = False
+        database = vdao.VDAO(args.dataset_dir, args.file, mode=mode,
+                            val_set=validation)
+    else:
+        validation =  args.val_roc
+        database = vdao.VDAO(args.dataset_dir, args.file, mode=mode,
+                            val_set=validation, val_ratio=args.val_ratio,
+                            aloi_file=args.aloi_file)
+
+    # Set tensorflow session configurations
     config = tf.ConfigProto()
     config.gpu_options.visible_device_list = ''
     K.set_session(tf.Session(config=config))
     print('save results: {}'.format(args.save_dir))
 
-    # Setting dataset helper
-    database = vdao.VDAO(args.dataset_dir, args.train_file, args.test_file)
 
     # Useful metrics to record
     metrics_list = [metrics.fnr, metrics.fpr, metrics.distance, metrics.f1,
                     metrics.tp, metrics.tn, metrics.fp, metrics.fn]
-    metrics_names = [metric.__name__ for metric in metrics_list]
+    meters = {func.__name__: func for func in metrics_list}
 
-    cross_avgs = {}
-    cross_best = {}
+    thresholds = kwargs.pop('thresholds', None)
+
+    logger = {}
+    # Apply func to data comming from all specified layers
     for layer in LAYER_NAME:
+        print('layer: {}'.format(layer))
         database.set_layer(layer)
-        cross_avgs[layer] = {}
-        test_sizes = []
-        meters_test = []
-        thres_vals = np.arange(0.01, 1.0, 0.01)
+        layer_path = os.path.join(args.save_dir, layer)
+        cross_history = utils.History()
+        outputs = []
 
-        for test_idx, (_, _, test_samples, test_size) \
-                in enumerate(database.load_generator(val_set=False)):
-            test_sizes.append(test_size)
+        roc = metrics.ROC() if validation is True else None
 
-            model_name = os.path.join(
-                args.model_path, layer, 'model.test{:02d}-ep'.format(test_idx))
-            model_name = glob.glob(model_name + '*')[-1]
-            model = keras.models.load_model(model_name, compile=False)
+        # Apply func to each partition of the data
+        for group_idx, (samples, set_size) in enumerate(
+                database.load_generator(
+                    **utils.parse_kwparams(args.cv_params),
+                    inner_kwargs=utils.parse_kwparams(args.inner_val_params))):
 
+            # Load old model or create a new one
+            if args.load_model is not None:
+                model_name = os.path.join(args.load_model, layer,
+                                          'model.test{:02d}-ep'.format(group_idx))
+                model_name = glob.glob(model_name + '*')[-1]
+                model = keras.models.load_model(model_name, compile=False)
+            else:
+                model = archs.__dict__[args.arch](
+                    input_shape=samples[0][0].shape[1:],
+                    weight_decay=args.weight_decay,
+                    **utils.parse_kwparams(args.arch_params))
+
+            # Make it run on mutiple GPUs (batchwise)
             if args.multi_gpu:
                 try:
                     model = multi_gpu_model(model)
@@ -77,36 +96,70 @@ def predict(args):
                     print('Not possible to run on multiple GPUs\n'
                           'Error: {}'.format(e))
 
-            # DOUBT: Does model.evaluate update stateful metric's states?
-            probas_ = model.predict_proba(
-                test_samples[0],
-                batch_size=args.batch_size,
-                verbose=0).squeeze()
+            if mode == 'train':
+                output = func(args, model, samples, set_size, meters, layer_path,
+                            group_idx, cross_history,  roc=roc)
+            else:
+                if type(thresholds) is dict:
+                    group_thresholds = thresholds[layer][group_idx]
+                else:
+                    group_thresholds = thresholds
 
-            meters_test += [metrics.compose(metrics_list,
-                                            (test_samples[1], probas_),
-                                            thres_vals.tolist())]
+                output = func(args, model, samples, set_size, meters,
+                             threshold=group_thresholds)
 
-        df = pd.DataFrame(meters_test, columns=metrics_names)
-        for col in df.columns:
-            cross_avgs[layer][col] = np.average(np.stack(df[col]),
-                                                weights=test_sizes, axis=0)
+            outputs += [output]
 
-        best_idx = np.argmin(cross_avgs[layer]['distance'])
+        if mode == 'train':
+            logger[layer] = {'history': cross_history}
+            if roc is not None:
+                logger[layer].update({'roc': roc})
+        else:
+            logger[layer] = {'output': outputs}
 
-        cross_best[layer] = {name: meter[best_idx] for name,
-                             meter in cross_avgs[layer].items()}
-        cross_best[layer]['threshold'] = thres_vals[best_idx]
-        print(cross_best)
+        print('\n' + '* ' * 80 + '\n\n')
 
-    utils.save_data({'all': cross_avgs, 'best': cross_best}, args.save_dir)
+    return logger
 
 
-def train(args):
-    config = tf.ConfigProto()
-    config.gpu_options.visible_device_list = ''
-    K.set_session(tf.Session(config=config))
-    print('save models and logs to dir: {}'.format(args.save_dir))
+def _eval(args, model, test_samples, set_size, meters, threshold=0.5):
+    measures = []
+    set_size = np.hstack((np.zeros(1, dtype='int64'), np.cumsum(set_size['test'])))
+    data, labels = test_samples
+    for start, stop in zip(set_size[:-1], set_size[1:]):
+        measurements, _ = _evaluate(model, (data[start:stop], labels[start:stop]), meters,
+                                    tune_threshold=False, batch_size=args.batch_size,
+                                    thresholds=threshold, mode='test', verbose=0)
+        measures += [measurements]
+    return measures
+
+
+def eval(args):
+    # use common and _evaluate
+    # Check if _evaluate is still correct after changings
+    # Inspect results: they seem far too good to be true
+    checkpoint = pickle.load(open(os.path.join(
+                                    args.load_model,'summary.pkl'), 'rb'))
+    thresholds = {}
+    for key, val in checkpoint.items():
+        if key == 'config':
+            continue
+        try:
+            thres = val['history'].history['val']['thresholds']
+            # thres = val['val']['thresholds']
+            thresholds.update({key: np.asarray(thres)[:, 1]})
+        except KeyError:
+            print('No optimized threshold found')
+            thresholds = None
+
+    logger = _common(args, _eval, thresholds=thresholds)
+    logger = {layer: results['output'] for layer, results in logger.items()}
+    utils.save_data(logger, os.path.join(args.load_model, 'test-results'),
+            json_format=False, pickle_format=True)
+
+
+def _train(args, model, samples, set_size, meters, layer_path, group_idx,
+        cross_history, roc=None, **kwargs):
 
     # optimizer
     optimizer = optimizers[args.optim.lower()](lr=args.lr)
@@ -116,218 +169,163 @@ def train(args):
         args.lr_factor**(epoch // args.lr_span)
     lr_scheduler = callbacks.LearningRateScheduler(schedule)
 
-    # Setting dataset helper
-    database = vdao.VDAO(args.dataset_dir, args.train_file, args.test_file,
-                         val_ratio=args.val_ratio, aloi_file=args.aloi_file)
+    train_samples, val_samples = samples
+    for mode, size in set_size.items():
+        if size == 0:
+            continue
+        cross_history.update('nb_vids', size, mode=mode)
 
-    # Useful metrics to record
-    metrics_list = [metrics.fnr, metrics.fpr, metrics.distance, metrics.f1,
-                    metrics.tp, metrics.tn, metrics.fp, metrics.fn]
-    metrics_names = [metric.__name__ for metric in metrics_list]
+    # Glue everything together
+    model.compile(
+        loss='binary_crossentropy',
+        optimizer=optimizer,
+        metrics=['accuracy',
+                 metrics.FalseNegRate(),
+                 metrics.FalsePosRate(),
+                 metrics.Distance(),
+                 metrics.FBetaScore(beta=1),
+                 metrics.TruePos(),
+                 metrics.TrueNeg(),
+                 metrics.FalsePos(),
+                 metrics.FalseNeg()])
 
-    cross_history = {}
-    for layer in LAYER_NAME:
-        # seen_vids = []
-        test_sizes = []
-        database.set_layer(layer)
-        # aloi_samples = database.load_data(mode='aloi')
-        cross_history[layer] = {'train': {}, 'val': {}, 'test': {}}
-        roc = metrics.ROC()
-        layer_path = os.path.join(args.save_dir, layer)
+    if not os.path.exists(layer_path):
+        os.makedirs(layer_path)
 
-        for test_idx, (train_samples, val_samples, test_samples, test_size) \
-                in enumerate(database.load_generator()):
-            # for test_idx, test_subset in enumerate(VDAO_TEST_ENTRIES_OBJ_NB):
+    # Should I monitor here the best val_loss or the metrics of interest?
+    # If not all samples are used in an epoch val_loss is noisy
+    checkpointer = callbacks.ModelCheckpoint(
+        os.path.join(layer_path,
+                     'model.test{:02d}-ep{{epoch:02d}}.pth'.format(
+                         group_idx)),
+        monitor='val_loss', save_best_only=True, mode='min')
+    csv_logger = callbacks.CSVLogger(
+        os.path.join(layer_path,
+                     'training.test{:02d}.log'.format(group_idx)))
 
-            # outside_training = [vid for vid in test_subset if vid in seen_vids]
-            # seen_vids += test_subset
+    # Train the model
+    history = model.fit(
+        x=train_samples[0],
+        y=train_samples[1],
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        shuffle=True,
+        verbose=1,
+        callbacks=[lr_scheduler, csv_logger, checkpointer],
+        validation_data=val_samples)
 
-            # # Load data
-            # train_samples, test_samples = database.load_data(
-            #     test_subset, exclude_vids=outside_training)
-            # train_samples, val_samples = database.split_validation(mode='video')
+    print('\nFinished training {}'.format(group_idx+1))
 
-            # if args.aloi_file is not None:
-            #     train_samples = tuple(np.concatenate((simple, aloi)) for simple, \
-            #         aloi in zip(train_samples, aloi_samples))
+    # TODO: log the best value and not the latest
+    for name, meter in history.history.items():
+        mode = 'val' if name.startswith('val') else 'train'
+        cross_history.update(name, meter[-1], mode)
 
-            test_sizes.append(test_size)
+    if val_samples is not None:
+        measurements, thres_vals = _evaluate(
+            model, (val_samples, set_size['val']), meters, mode='val',
+            batch_size=args.batch_size, tune_threshold=True, roc=roc)
 
-            # Create model
-            model = mlp.mlp(
-                input_shape=train_samples[0].shape[1:],
-                neurons_per_layer=args.nb_neurons,
-                weight_decay=args.weight_decay)
+        for name, measures in measurements.items():
+            cross_history.update(
+                'pp_' + name, [measure for measure in measures], mode='val')
 
-            if args.multi_gpu:
-                try:
-                    model = multi_gpu_model(model)
-                except Exception as e:
-                    print('Not possible to run on multiple GPUs\n'
-                          'Error: {}'.format(e))
+        cross_history.update('thresholds', thres_vals, mode='val')
+        return {'history': cross_history, 'roc': roc}
 
-            # Glue everything together
-            model.compile(
-                loss='binary_crossentropy',
-                optimizer=optimizer,
-                metrics=['accuracy',
-                         metrics.FalseNegRate(),
-                         metrics.FalsePosRate(),
-                         metrics.Distance(),
-                         metrics.FBetaScore(beta=1),
-                         metrics.TruePos(),
-                         metrics.TrueNeg(),
-                         metrics.FalsePos(),
-                         metrics.FalseNeg()])
+    return {'history': cross_history}
 
-            if not os.path.exists(layer_path):
-                os.makedirs(layer_path)
 
-            checkpointer = callbacks.ModelCheckpoint(
-                os.path.join(layer_path,
-                             'model.test{:02d}-ep{{epoch:02d}}.pth'.format(
-                                 test_idx)))
-            csv_logger = callbacks.CSVLogger(
-                os.path.join(layer_path,
-                             'training.test{:02d}.log'.format(test_idx)))
+def _evaluate(model, data, meters, batch_size=32, verbose=1, mode='val',
+              tune_threshold=False, thresholds=[0.5], roc=None, history=None):
+    if mode not in ['val', 'test']:
+        raise ValueError('mode should be either val or test')
+    if mode is 'test' and tune_threshold is True:
+        raise ValueError(
+            'You cannot tune the threshold on the test data silly, that is cheating')
+    if tune_threshold is True and (roc is None or isinstance(roc, metrics.ROC) is False):
+        # Optionally I can create a metrics.ROC object here
+        raise ValueError(
+            'roc should be an instance of metrics.ROC to optimize threshold')
+    if history is not None and isinstance(history, utils.History) is False:
+        raise ValueError('history should be an instance of utils.History')
 
-            # Train the model
-            history = model.fit(
-                x=train_samples[0],
-                y=train_samples[1],
-                batch_size=args.batch_size,
-                epochs=args.epochs,
-                shuffle=True,
-                verbose=1,
-                callbacks=[lr_scheduler, csv_logger, checkpointer],
-                validation_data=val_samples)
+    try:
+        (samples, labels), set_size = data
+    except ValueError:
+        samples, labels = data
+        set_size = None
 
-            print('\nFinished training {}'.format(test_idx+1))
+    probas_ = model.predict_proba(
+        samples, batch_size=batch_size, verbose=0).squeeze()
 
-            for name, meter in history.history.items():
-                # should I log the highest or the latest value here? (stdout)
-                try:
-                    mode = 'val' if name.startswith('val') else 'train'
-                    name = name.split('_')[-1]
-                    cross_history[layer][mode][name] += [float(meter[-1])]
-                except KeyError:
-                    cross_history[layer][mode][name] = [float(meter[-1])]
+    # Compute ROC curve and find thresold that minimizes dist
+    if tune_threshold:
+        best_threshold, _ = roc(labels, probas_)
+        thresholds = thresholds + [best_threshold]
 
-            probas_ = model.predict_proba(
-                val_samples[0],
-                batch_size=args.batch_size,
-                verbose=0).squeeze()
+    # Evaluate on VAL set (threshold @ 50%. @ `best_threshold`)
+    meters_val = metrics.compose(meters.values(), (labels, probas_),
+                                 threshold=thresholds)
 
-            # Compute ROC curve and find thresold that minimizes dist
-            best_threshold, best_dist = roc(val_samples[1], probas_)
+    if history:
+        for name, measures in zip(meters.keys(), meters_val):
+            history.update(
+                'pp_' + name, [measure for measure in measures], mode=mode)
+        # history.update('thresholds', thresholds, mode=mode)
 
-            # Evaluate on VAL set (threshold @ 50%. @ `best_threshold`)
-            thres_vals = [0.5, best_threshold]
-            meters_val = metrics.compose(metrics_list,
-                                         (val_samples[1], probas_), thres_vals)
-
-            for name, meters in zip(metrics_names, meters_val):
-                try:
-                    cross_history[layer]['val']['pp_' + name] += [[
-                        float(meter) for meter in meters]]
-                except:
-                    cross_history[layer]['val']['pp_' + name] = [[
-                        float(meter) for meter in meters]]
-
-            # Print validation results w/ thresholds other than 0.5
-            msg = ['VAL:: thresholds @ {}\n'.format(thres_vals[1:])]
-            msg += [
-                '{0}: {1}  \n'.format(
-                    name, meter[-1][1:] if isinstance(meter[-1], (list, tuple))
-                    else meter[-1]) for name, meter in
-                cross_history[layer]['val'].items() if name is not 'thresholds'
-            ]
-            print(''.join(msg))
-
-            # DOUBT: Does model.evaluate update stateful metric's states?
-            probas_ = model.predict_proba(
-                test_samples[0],
-                batch_size=args.batch_size,
-                verbose=0).squeeze()
-
-            # Evaluate on TEST set (threshold @ 50%. @ `best_threshold`)
-            meters_test = metrics.compose(metrics_list,
-                                          (test_samples[1], probas_), thres_vals)
-
-            for name, meters in zip(metrics_names, meters_test):
-                try:
-                    cross_history[layer]['test'][name] += [[
-                        float(meter) for meter in meters]]
-                except:
-                    cross_history[layer]['test'][name] = [[
-                        float(meter) for meter in meters]]
-
-            # Print test results w/ all thresholds
-            msg = ['\nTEST:: thresholds @ {}\n'.format(thres_vals)]
-            msg += [
-                '{0}: {1}  \n'.format(
-                    name, meter[-1]) for name, meter in
-                cross_history[layer]['test'].items() if name is not 'thresholds'
-            ]
-            print(''.join(msg))
-
-            thres_vals = [[float(thres) for thres in thres_vals]]
-            for mode in ['val', 'test']:
-                try:
-                    cross_history[layer][mode]['thresholds'] += thres_vals
-                except:
-                    cross_history[layer][mode]['thresholds'] = thres_vals
-
-        for mode, history in cross_history[layer].items():
-            for name, meter in history.items():
-                if name is 'thresholds':
-                    continue
-                cross_history[layer][mode][name] += [
-                    np.average(meter, weights=test_sizes, axis=0).astype(
-                        'float64').tolist()]
-
-        cross_history[layer]['test']['nb_vids'] = test_sizes
-
-        mean_tpr, mean_auc = [meter.astype(
-            'float64').tolist() for meter in roc.mean()]
-        std_tpr, std_auc = [meter.astype('float64').tolist()
-                            for meter in roc.std()]
-        cross_history[layer]['val']['roc'] = {
-            'interp_tprs-mean': mean_tpr,
-            'auc-mean': mean_auc,
-            'interp_tprs-std': std_tpr,
-            'auc-std': std_auc}
-        roc.plot(os.path.join(layer_path, 'roc-crossval.eps'))
-
-        # Print layer avg results @50% and @`best_threshold`
-        msg = ['\nLAYER: {} :: thresholds @ {}\n'.format(layer,
-                                                         cross_history[layer]['test']['thresholds'])]
-        msg += [
-            '| {0}: '.format(name) + ('{:.4f}  '*int(len(meter[-1]))).format(
-                *meter[-1]) for name, meter in
-            cross_history[layer]['test'].items() if name not in ['thresholds', 'nb_vids']
-        ]
+    if verbose:
+        msg = ['\n{}:: thresholds @ {}\n'.format(mode.upper(), thresholds)]
+        msg += ['{0}: {1}\n'.format(name, measures) for name, measures in
+                zip(meters.keys(), meters_val)]
         print(''.join(msg))
-        print('\n' + '* ' * 80 + '\n\n')
 
-    # Plot mean ROC curve for each layer
-    for layer, info in cross_history.items():
-        auc_mean = info['val']['roc']['auc-mean']
-        auc_std = info['val']['roc']['auc-std']
-        plt.plot(roc.mean_fpr, info['val']['roc']['interp_tprs-mean'],
-                 lw=2, alpha=0.8, label=r'ROC - {} (AUC = {:.2f} $\pm$ {:0.2f})'.format(
-            layer.split('_')[0], auc_mean, auc_std))
-    plt.plot([0, 1], [0, 1], linestyle='--', lw=1,
-             color='r', label='Identidade', alpha=.8)
-    roc.label_plot()
-    plt.savefig(os.path.join(args.save_dir, 'mean-roc.eps'))
-    plt.close()
+        # utils.print_result(history.history[mode],
+        #     '{}:: thresholds @ {}'.format(mode.upper(), thresholds), exclude=['thresholds'])
 
-    # saving quick access summary w/ results
+    return {key: val for key, val in zip(meters.keys(), meters_val)}, thresholds
+
+
+def train(args):
+
+    logger = _common(args, _train)
+    for layer in logger.keys():
+        logger[layer]['history'].averages(weights_key='nb_vids',
+                                          exclude=['thresholds'])
+    # Compute ROC if data available
+    if args.val_roc is True:
+        roc_stats = {'tprs': {}, 'auc': {}}
+        plt.figure('all_layers')
+        for layer, results in logger.items():
+            roc = results['roc']
+
+            for name, stats in zip(('mean', 'std'), (roc.mean(), roc.std())):
+                roc_stats['tprs'][name], roc_stats['auc'][name] = stats
+
+            logger[layer]['roc'] = roc_stats
+            roc.plot(os.path.join(os.path.join(args.save_dir, layer),
+                                  'roc-crossval.eps'))
+
+            # Plot mean ROC curve for each layer
+            plt.figure('all_layers')
+            auc_mean, auc_std = roc_stats['auc']['mean'], roc_stats['auc']['std']
+            plt.plot(roc.mean_fpr, roc_stats['tprs']['mean'], lw=2, alpha=0.8,
+                     label=r'ROC - {} (AUC = {:.2f} $\pm$ {:0.2f})'.format(
+                layer.split('_branch')[0], auc_mean, auc_std))
+
+        plt.plot([0, 1], [0, 1], linestyle='--', lw=1,
+                 color='r', label='Identidade', alpha=.8)
+        metrics.ROC.label_plot()
+        plt.legend(bbox_to_anchor=(1.04,1), loc="upper left")
+        plt.savefig(os.path.join(args.save_dir, 'mean-roc.eps'),
+                    bbox_inches='tight')
+        plt.close()
+
+    # Save history
     del args.func
-    cross_history['config'] = vars(args)
-
-    utils.save_data(cross_history, os.path.join(args.save_dir, 'summary'))
+    logger['config'] = vars(args)
+    utils.save_data(logger, os.path.join(args.save_dir, 'summary'),
+                    json_format=False)
 
 
 if __name__ == '__main__':
@@ -366,6 +364,20 @@ if __name__ == '__main__':
         type=str,
         default='models/',
         help='path to save results to')
+    parser.add_argument(
+        '--file',
+        type=str,
+        metavar='PATH',
+        # default='59_videos_test_batch.h5', -- test
+        # default='train_batch_VDAO.h5',     -- train
+        help='Path to hdf5 data file')
+    parser.add_argument(
+        '--load',
+        dest='load_model',
+        type=str,
+        metavar='PATH',
+        default=None,
+        help='Path to trained model dir')
 
     # Train parser
     tr_parser = subparsers.add_parser('train', help='Network training')
@@ -377,33 +389,59 @@ if __name__ == '__main__':
         metavar='N',
         help='number of total epochs to run')
     tr_parser.add_argument(
+        '--val-roc',
+        action='store_true',
+        help='Whether to split train set on train/val')
+    tr_parser.add_argument(
         '--val-ratio',
         default=0.1,
         type=float,
         metavar='N',
-        help='Val set relative to train size (ratio)')
-    tr_parser.add_argument(
-        '--test-file',
-        type=str,
-        metavar='PATH',
-        default='59_videos_test_batch.h5',
-        help='Path to test file'
-    )
-    tr_parser.add_argument(
-        '--train-file',
-        type=str,
-        metavar='PATH',
-        default='train_batch_VDAO.h5',
-        help='Path to train file',
-    )
+        help='Val set size relative to train size (ratio)')
     tr_parser.add_argument(
         '--aloi-file',
         type=str,
         metavar='PATH',
         default=None,
         help='Path to ALOI-augmented imgs file'
-        # 'train_batch_ALOI.h5'
     )
+    parser.add_argument(
+        '--cv-params',
+        metavar='PARAMS',
+        # default=['method=k_fold', 'n_splits=5'],
+        default=['method=leave_one_out'],
+        # default=['method=manual', 'filename=legacy/test_folds.json'],
+        # default=[],
+        nargs='+',
+        type=str,
+        help='cross validation params, methods: ' + ' | '.join(
+            list(vdao.group_fetching.keys())) + ' (default method: leave_one_out)'
+    )
+    parser.add_argument(
+        '--inner-val-params',
+        metavar='PARAMS',
+        default=['mode=video'],
+        nargs='+',
+        type=str,
+        help='inner validation params (default method: LeaveOneGroupOut)'
+    )
+    # Architecture
+    parser.add_argument(
+        '--arch',
+        '-a',
+        metavar='ARCH',
+        default='mlp',
+        choices=arch_names,
+        help='model architecture: ' + ' | '.join(arch_names) +
+        ' (default: mlp)')
+    parser.add_argument(
+        '--arch-params',
+        metavar='PARAMS',
+        default=['nb_neurons=[50, 1600]'],
+        nargs='+',
+        type=str,
+        help='model architecture params')
+
     # Architecture parameters
     tr_parser.add_argument(
         '--nb-neurons',
@@ -448,29 +486,9 @@ if __name__ == '__main__':
     tr_parser.set_defaults(func=train)
 
     # Predict parser
-    pred_parser = subparsers.add_parser('predict', help='Network training')
+    pred_parser = subparsers.add_parser('eval', help='Network training')
 
-    pred_parser.add_argument(
-        '--test-file',
-        type=str,
-        metavar='PATH',
-        default='59_videos_test_batch.h5',
-        help='Path to test file')
-
-    pred_parser.add_argument(
-        '--train-file',
-        type=str,
-        metavar='PATH',
-        default='train_batch_VDAO.h5',
-        help='Path to train file')
-    pred_parser.add_argument(
-        '--load',
-        dest='model_path',
-        type=str,
-        metavar='PATH',
-        help='Path to trained model dir')
-
-    pred_parser.set_defaults(func=predict)
+    pred_parser.set_defaults(func=eval)
 
     args = parser.parse_args()
     print(args)
