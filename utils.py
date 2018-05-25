@@ -46,7 +46,6 @@ class NumpyEncoder(json.JSONEncoder):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
         if isinstance(obj, History):
-            print('got inside Hisotry objj decoder numpy')
             return obj.history
         return json.JSONEncoder.default(self, obj)
 

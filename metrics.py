@@ -400,7 +400,7 @@ class ROC(object):
         Area Under Curve for interpolated ROC, accumulating over the its calls.
         Returns the optimal threshold for the specified metric
     """
-
+    fig_number = 0
     def __init__(self):
         self.inter_tprs = []
         self.tprs = []
@@ -410,6 +410,8 @@ class ROC(object):
         self.mean_auc = None
         self.std_tpr = None
         self.std_auc = None
+        ROC.fig_number +=1
+        self.fig = ROC.fig_number
         # self.func = metric
         # self.argcmp = K.argmin
         self.mean_fpr = np.linspace(0, 1, 100)
@@ -450,6 +452,7 @@ class ROC(object):
         return self.std_tpr, self.std_auc
 
     def plot(self, filename='roc-crossval.eps', std=True):
+        plt.figure(num=self.fig)
         mean_tpr, mean_auc = self.mean()
         std_tpr, std_auc = self.std()
 
@@ -478,13 +481,14 @@ class ROC(object):
         plt.plot([0, 1], [0, 1], linestyle='--', lw=1,
                  color='r', label='Identidade', alpha=.8)
 
-        self.label_plot()
+        ROC.label_plot()
         if '.' not in filename:
             filename += '.eps'
         plt.savefig(filename, bbox_inches='tight')
         plt.close()
 
-    def label_plot(self):
+    @staticmethod
+    def label_plot():
         plt.xlim([-0.05, 1.05])
         plt.ylim([-0.05, 1.05])
         plt.xlabel('Taxa de Falso Positivo')
