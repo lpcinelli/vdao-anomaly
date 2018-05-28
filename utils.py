@@ -3,6 +3,13 @@ import pickle
 
 import numpy as np
 
+from sklearn.base import TransformerMixin
+
+class Flatten(TransformerMixin):
+    def fit(self, X, y=None):
+        return self
+    def transform(self, X):
+        return X.reshape(X.shape[0], -1)
 
 class History(object):
     def __init__(self):

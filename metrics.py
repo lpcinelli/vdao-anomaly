@@ -159,14 +159,15 @@ def compose(metrics, results, threshold=0.5, eps=EPS):
     """
     meter = []
     y_true, y_pred = results
-    if not isinstance(threshold, (tuple, list)):
+    if not isinstance(threshold, (tuple, list, np.ndarray)):
         threshold = (threshold, )
 
     n = len(threshold)
     for metric, thres in product(metrics, threshold):
         meter += [metric(y_true, y_pred, threshold=thres, eps=eps)]
     meter = K.get_session().run(meter)
-    return list(zip(*[iter(meter)] * n))
+
+    return np.asarray([meter[i:i + n] for i in range(0, len(meter), n)])
 
 
 class TruePos(Layer):
@@ -401,6 +402,7 @@ class ROC(object):
         Returns the optimal threshold for the specified metric
     """
     fig_number = 0
+
     def __init__(self):
         self.inter_tprs = []
         self.tprs = []
@@ -410,7 +412,7 @@ class ROC(object):
         self.mean_auc = None
         self.std_tpr = None
         self.std_auc = None
-        ROC.fig_number +=1
+        ROC.fig_number += 1
         self.fig = ROC.fig_number
         # self.func = metric
         # self.argcmp = K.argmin

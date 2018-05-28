@@ -17,33 +17,25 @@ import keras
 import metrics
 import tensorflow as tf
 import utils
+from archs.networks import optimizers
 from datasets.hdf5_vdao import LAYER_NAME
 from keras import backend as K
 from keras import callbacks
-from keras.optimizers import SGD, Adam, Adamax
-from keras.utils import multi_gpu_model
-
-import pdb
-
-optimizers = {'adam': Adam, 'adamax': Adamax, 'sgd': SGD}
 
 arch_names = sorted(name for name in archs.__dict__
                     if name.islower() and not name.startswith("__")
                     and callable(archs.__dict__[name]))
 
 
-def _common(args, func, **kwargs):
-    mode = 'train' if func.__name__ == '_train' else 'test'
+def _common(args, mode, validation=False, **kwargs):
     if mode == 'test':
         # Instatiate dataloader
-        validation = False
         database = vdao.VDAO(args.dataset_dir, args.file, mode=mode,
-                            val_set=validation)
+                             val_set=validation)
     else:
-        validation =  args.val_roc
         database = vdao.VDAO(args.dataset_dir, args.file, mode=mode,
-                            val_set=validation, val_ratio=args.val_ratio,
-                            aloi_file=args.aloi_file)
+                             val_set=validation, val_ratio=args.val_ratio,
+                             aloi_file=args.aloi_file)
 
     # Set tensorflow session configurations
     config = tf.ConfigProto()
@@ -51,20 +43,20 @@ def _common(args, func, **kwargs):
     K.set_session(tf.Session(config=config))
     print('save results: {}'.format(args.save_dir))
 
-
     # Useful metrics to record
     metrics_list = [metrics.fnr, metrics.fpr, metrics.distance, metrics.f1,
                     metrics.tp, metrics.tn, metrics.fp, metrics.fn]
     meters = {func.__name__: func for func in metrics_list}
 
     thresholds = kwargs.pop('thresholds', None)
+    arch = archs.__dict__[args.arch.lower()]
+    arch_params = utils.parse_kwparams(args.arch_params)
 
     logger = {}
     # Apply func to data comming from all specified layers
     for layer in LAYER_NAME:
         print('layer: {}'.format(layer))
         database.set_layer(layer)
-        layer_path = os.path.join(args.save_dir, layer)
         cross_history = utils.History()
         outputs = []
 
@@ -78,35 +70,30 @@ def _common(args, func, **kwargs):
 
             # Load old model or create a new one
             if args.load_model is not None:
-                model_name = os.path.join(args.load_model, layer,
-                                          'model.test{:02d}-ep'.format(group_idx))
-                model_name = glob.glob(model_name + '*')[-1]
-                model = keras.models.load_model(model_name, compile=False)
-            else:
-                model = archs.__dict__[args.arch](
-                    input_shape=samples[0][0].shape[1:],
-                    weight_decay=args.weight_decay,
-                    **utils.parse_kwparams(args.arch_params))
-
-            # Make it run on mutiple GPUs (batchwise)
-            if args.multi_gpu:
                 try:
-                    model = multi_gpu_model(model)
-                except Exception as e:
-                    print('Not possible to run on multiple GPUs\n'
-                          'Error: {}'.format(e))
+                    model = arch(load_path=args.load_model, save_path=args.save_dir,
+                                 layer=layer, group_idx=group_idx)
+                except FileNotFoundError:
+                    print('file not found for layer {}'.format(layer))
+                    continue
+            else:
+                model = arch(load_path=args.load_model, save_path=args.save_dir,
+                             layer=layer, group_idx=group_idx,
+                             input_shape=samples[0][0].shape[1:],
+                             weight_decay=args.weight_decay, **arch_params)
 
             if mode == 'train':
-                output = func(args, model, samples, set_size, meters, layer_path,
-                            group_idx, cross_history,  roc=roc)
+                output = _train(args, model, samples, set_size, meters,
+                                cross_history,  roc=roc)
+                print('\nFinished training {}'.format(group_idx+1))
             else:
                 if type(thresholds) is dict:
                     group_thresholds = thresholds[layer][group_idx]
                 else:
                     group_thresholds = thresholds
 
-                output = func(args, model, samples, set_size, meters,
-                             threshold=group_thresholds)
+                output = _eval(args, model, samples, set_size, meters,
+                               threshold=group_thresholds)
 
             outputs += [output]
 
@@ -124,7 +111,8 @@ def _common(args, func, **kwargs):
 
 def _eval(args, model, test_samples, set_size, meters, threshold=0.5):
     measures = []
-    set_size = np.hstack((np.zeros(1, dtype='int64'), np.cumsum(set_size['test'])))
+    set_size = np.hstack(
+        (np.zeros(1, dtype='int64'), np.cumsum(set_size['test'])))
     data, labels = test_samples
     for start, stop in zip(set_size[:-1], set_size[1:]):
         measurements, _ = _evaluate(model, (data[start:stop], labels[start:stop]), meters,
@@ -135,39 +123,41 @@ def _eval(args, model, test_samples, set_size, meters, threshold=0.5):
 
 
 def eval(args):
-    # use common and _evaluate
-    # Check if _evaluate is still correct after changings
-    # Inspect results: they seem far too good to be true
     checkpoint = pickle.load(open(os.path.join(
-                                    args.load_model,'summary.pkl'), 'rb'))
+        args.load_model, 'summary.pkl'), 'rb'))
     thresholds = {}
-    for key, val in checkpoint.items():
-        if key == 'config':
-            continue
-        try:
-            thres = val['history'].history['val']['thresholds']
-            # thres = val['val']['thresholds']
-            thresholds.update({key: np.asarray(thres)[:, 1]})
-        except KeyError:
-            print('No optimized threshold found')
-            thresholds = None
+    if args.optim_thres is True:
+        for key, val in checkpoint.items():
+            if key == 'config':
+                continue
+            try:
+                thres = val['history'].history['val']['thresholds']
+                # thres = val['val']['thresholds']
+                thresholds.update({key: np.asarray(thres)[:, 1]})
+            except KeyError:
+                print('No optimized threshold found')
+                thresholds = None
+    else:
+        thresholds = None
 
-    logger = _common(args, _eval, thresholds=thresholds)
-    logger = {layer: results['output'] for layer, results in logger.items()}
-    utils.save_data(logger, os.path.join(args.load_model, 'test-results'),
-            json_format=False, pickle_format=True)
+    logger = _common(args, 'test', thresholds=thresholds)
+
+    all_results = {}
+    for layer, results in logger.items():
+        res = pd.concat([pd.DataFrame(group)
+                         for group in results['output']]).reset_index(drop=True)
+        res = res.applymap(lambda x: x[0])
+        res.to_csv(os.path.join(args.load_model, layer,
+                                'test-results.csv'), index=False)
+        all_results.update({layer: res})
+
+    # pdb.set_trace()
+    pd.concat(all_results, axis=1).to_csv(
+        os.path.join(args.load_model, 'test-results.csv'), index=False)
+    # read w/ header: pd.read_csv('models/bb/test-results.csv', header=[0,1])
 
 
-def _train(args, model, samples, set_size, meters, layer_path, group_idx,
-        cross_history, roc=None, **kwargs):
-
-    # optimizer
-    optimizer = optimizers[args.optim.lower()](lr=args.lr)
-
-    # learning rate schedule
-    def schedule(epoch, lr): return lr * \
-        args.lr_factor**(epoch // args.lr_span)
-    lr_scheduler = callbacks.LearningRateScheduler(schedule)
+def _train(args, model, samples, set_size, meters, cross_history, roc=None, **kwargs):
 
     train_samples, val_samples = samples
     for mode, size in set_size.items():
@@ -175,51 +165,30 @@ def _train(args, model, samples, set_size, meters, layer_path, group_idx,
             continue
         cross_history.update('nb_vids', size, mode=mode)
 
-    # Glue everything together
-    model.compile(
-        loss='binary_crossentropy',
-        optimizer=optimizer,
-        metrics=['accuracy',
-                 metrics.FalseNegRate(),
-                 metrics.FalsePosRate(),
-                 metrics.Distance(),
-                 metrics.FBetaScore(beta=1),
-                 metrics.TruePos(),
-                 metrics.TrueNeg(),
-                 metrics.FalsePos(),
-                 metrics.FalseNeg()])
-
-    if not os.path.exists(layer_path):
-        os.makedirs(layer_path)
-
-    # Should I monitor here the best val_loss or the metrics of interest?
-    # If not all samples are used in an epoch val_loss is noisy
-    checkpointer = callbacks.ModelCheckpoint(
-        os.path.join(layer_path,
-                     'model.test{:02d}-ep{{epoch:02d}}.pth'.format(
-                         group_idx)),
-        monitor='val_loss', save_best_only=True, mode='min')
-    csv_logger = callbacks.CSVLogger(
-        os.path.join(layer_path,
-                     'training.test{:02d}.log'.format(group_idx)))
+    if hasattr(model, 'compile'):
+        model.set_batch(args.batch_size)
+        model.set_epochs(args.epochs)
+        model.compile(args.optim, args.lr, args.lr_span, args.lr_factor,
+                      ['accuracy',
+                       metrics.FalseNegRate(),
+                       metrics.FalsePosRate(),
+                       metrics.Distance(),
+                       metrics.FBetaScore(beta=1),
+                       metrics.TruePos(),
+                       metrics.TrueNeg(),
+                       metrics.FalsePos(),
+                       metrics.FalseNeg()])
+        model.parallelize(args.multi_gpu)
 
     # Train the model
-    history = model.fit(
-        x=train_samples[0],
-        y=train_samples[1],
-        batch_size=args.batch_size,
-        epochs=args.epochs,
-        shuffle=True,
-        verbose=1,
-        callbacks=[lr_scheduler, csv_logger, checkpointer],
-        validation_data=val_samples)
+    history = model.fit(X=train_samples[0], y=train_samples[1],
+                        val_data=val_samples)
 
-    print('\nFinished training {}'.format(group_idx+1))
-
-    # TODO: log the best value and not the latest
-    for name, meter in history.history.items():
-        mode = 'val' if name.startswith('val') else 'train'
-        cross_history.update(name, meter[-1], mode)
+    if hasattr(history, 'history'):
+        # TODO: log the best value and not the latest
+        for name, meter in history.history.items():
+            mode = 'val' if name.startswith('val') else 'train'
+            cross_history.update(name, meter[-1], mode)
 
     if val_samples is not None:
         measurements, thres_vals = _evaluate(
@@ -256,18 +225,16 @@ def _evaluate(model, data, meters, batch_size=32, verbose=1, mode='val',
         samples, labels = data
         set_size = None
 
-    probas_ = model.predict_proba(
-        samples, batch_size=batch_size, verbose=0).squeeze()
+    probas_ = model.predict_proba(samples).squeeze()
 
     # Compute ROC curve and find thresold that minimizes dist
     if tune_threshold:
         best_threshold, _ = roc(labels, probas_)
         thresholds = thresholds + [best_threshold]
-
     # Evaluate on VAL set (threshold @ 50%. @ `best_threshold`)
     meters_val = metrics.compose(meters.values(), (labels, probas_),
                                  threshold=thresholds)
-
+    # pdb.set_trace()
     if history:
         for name, measures in zip(meters.keys(), meters_val):
             history.update(
@@ -288,7 +255,7 @@ def _evaluate(model, data, meters, batch_size=32, verbose=1, mode='val',
 
 def train(args):
 
-    logger = _common(args, _train)
+    logger = _common(args, 'train', validation=args.val_roc)
     for layer in logger.keys():
         logger[layer]['history'].averages(weights_key='nb_vids',
                                           exclude=['thresholds'])
@@ -316,7 +283,7 @@ def train(args):
         plt.plot([0, 1], [0, 1], linestyle='--', lw=1,
                  color='r', label='Identidade', alpha=.8)
         metrics.ROC.label_plot()
-        plt.legend(bbox_to_anchor=(1.04,1), loc="upper left")
+        plt.legend(bbox_to_anchor=(1.04, 1), loc="upper left")
         plt.savefig(os.path.join(args.save_dir, 'mean-roc.eps'),
                     bbox_inches='tight')
         plt.close()
@@ -430,6 +397,7 @@ if __name__ == '__main__':
         '--arch',
         '-a',
         metavar='ARCH',
+        # default='randomforest',
         default='mlp',
         choices=arch_names,
         help='model architecture: ' + ' | '.join(arch_names) +
@@ -437,22 +405,11 @@ if __name__ == '__main__':
     parser.add_argument(
         '--arch-params',
         metavar='PARAMS',
+        # default=['nb_trees=100'],
         default=['nb_neurons=[50, 1600]'],
         nargs='+',
         type=str,
         help='model architecture params')
-
-    # Architecture parameters
-    tr_parser.add_argument(
-        '--nb-neurons',
-        '--neurons',
-        '--hidden-layers',
-        '--hidden',
-        nargs='+',
-        type=int,
-        default=[50, 1600],
-        metavar='NB_NEURONS',
-        help='List of hidden layers sizes')
 
     # Hyperparameters
     tr_parser.add_argument(
@@ -487,7 +444,10 @@ if __name__ == '__main__':
 
     # Predict parser
     pred_parser = subparsers.add_parser('eval', help='Network training')
-
+    pred_parser.add_argument(
+        '--optim-thres',
+        action='store_true',
+        help='whether to evaluate data using optimized thresholds or 0.5')
     pred_parser.set_defaults(func=eval)
 
     args = parser.parse_args()
