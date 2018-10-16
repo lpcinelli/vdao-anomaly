@@ -2,7 +2,6 @@ import argparse
 import glob
 import json
 import os
-import pdb
 import pickle
 
 import matplotlib as mpl
@@ -18,7 +17,7 @@ import metrics
 import tensorflow as tf
 import utils
 from archs.networks import optimizers
-from datasets.hdf5_vdao import LAYER_NAME
+from datasets.hdf5_vdao import VDAO.LAYER_NAME as LAYER_NAME
 from keras import backend as K
 from keras import callbacks
 
@@ -27,15 +26,11 @@ arch_names = sorted(name for name in archs.__dict__
                     and callable(archs.__dict__[name]))
 
 
-def _common(args, mode, validation=False, **kwargs):
-    if mode == 'test':
-        # Instatiate dataloader
-        database = vdao.VDAO(args.dataset_dir, args.file, mode=mode,
-                             val_set=validation)
-    else:
-        database = vdao.VDAO(args.dataset_dir, args.file, mode=mode,
-                             val_set=validation, val_ratio=args.val_ratio,
-                             aloi_file=args.aloi_file)
+def _common(args, mode, validation=False, val_ratio=0, aloi_file=None, **kwargs):
+    data_mode = 'test' if mode == 'test' else 'train'
+    database = vdao.VDAO(args.dataset_dir, args.file, mode=data_mode,
+                         val_set=validation, val_ratio=val_ratio,
+                         aloi_file=aloi_file)
 
     # Set tensorflow session configurations
     config = tf.ConfigProto()
@@ -48,7 +43,7 @@ def _common(args, mode, validation=False, **kwargs):
                     metrics.tp, metrics.tn, metrics.fp, metrics.fn]
     meters = {func.__name__: func for func in metrics_list}
 
-    thresholds = kwargs.pop('thresholds', None)
+    thresholds = kwargs.pop('thresholds', 0.5)
     arch = archs.__dict__[args.arch.lower()]
     arch_params = utils.parse_kwparams(args.arch_params)
 
@@ -79,7 +74,9 @@ def _common(args, mode, validation=False, **kwargs):
             else:
                 model = arch(load_path=args.load_model, save_path=args.save_dir,
                              layer=layer, group_idx=group_idx,
-                             input_shape=samples[0][0].shape[1:],
+                             #  input_shape=samples[0][0].shape[1:],
+                             input_shape=next(iter(samples.values()))[
+                                 0].shape[1:],
                              weight_decay=args.weight_decay, **arch_params)
 
             if mode == 'train':
@@ -92,7 +89,7 @@ def _common(args, mode, validation=False, **kwargs):
                 else:
                     group_thresholds = thresholds
 
-                output = _eval(args, model, samples, set_size, meters,
+                output = _eval(args, model, samples, set_size[data_mode], meters,
                                threshold=group_thresholds)
 
             outputs += [output]
@@ -111,15 +108,26 @@ def _common(args, mode, validation=False, **kwargs):
 
 def _eval(args, model, test_samples, set_size, meters, threshold=0.5):
     measures = []
+    preds = []
     set_size = np.hstack(
-        (np.zeros(1, dtype='int64'), np.cumsum(set_size['test'])))
-    data, labels = test_samples
+        (np.zeros(1, dtype='int64'), np.cumsum(set_size)))
+    (data, labels), vid_names = test_samples
+
+    try:
+        model.set_batch(args.batch_size)
+    except AttributeError:
+        pass
     for start, stop in zip(set_size[:-1], set_size[1:]):
-        measurements, _ = _evaluate(model, (data[start:stop], labels[start:stop]), meters,
-                                    tune_threshold=False, batch_size=args.batch_size,
-                                    thresholds=threshold, mode='test', verbose=0)
+        measurements, _, predictions = _evaluate(
+            model, (data[start:stop], labels[start:stop]), meters,
+            tune_threshold=False, batch_size=args.batch_size,
+            thresholds=threshold, mode='test', verbose=0)
+        predictions['predictions'] = (predictions['probas'] >
+                                      threshold).astype(predictions['labels'].dtype)
         measures += [measurements]
-    return measures
+        preds += [predictions]
+    return {'meters': measures, 'nb_vids': len(set_size)-1,
+            'results': preds, 'video_names': vid_names}
 
 
 def eval(args):
@@ -136,30 +144,65 @@ def eval(args):
                 thresholds.update({key: np.asarray(thres)[:, 1]})
             except KeyError:
                 print('No optimized threshold found')
-                thresholds = None
+                thresholds.update({key: 0.5})
     else:
-        thresholds = None
+        thresholds = 0.5
 
     logger = _common(args, 'test', thresholds=thresholds)
 
     all_results = {}
     for layer, results in logger.items():
-        res = pd.concat([pd.DataFrame(group)
+        res = pd.concat([pd.DataFrame(group['meters'])
                          for group in results['output']]).reset_index(drop=True)
         res = res.applymap(lambda x: x[0])
-        res.to_csv(os.path.join(args.load_model, layer,
-                                'test-results.csv'), index=False)
+        # res.to_csv(os.path.join(args.load_model, layer,
+        #                         args.save_dir), index=False)
         all_results.update({layer: res})
 
-    # pdb.set_trace()
     pd.concat(all_results, axis=1).to_csv(
-        os.path.join(args.load_model, 'test-results.csv'), index=False)
+        os.path.join(args.load_model, args.save_dir), index=False)
+    # read w/ header: pd.read_csv('models/bb/test-results.csv', header=[0,1])
+
+
+def predict(args):
+    checkpoint = pickle.load(open(os.path.join(
+        args.load_model, 'summary.pkl'), 'rb'))
+    thresholds = {}
+    if args.optim_thres is True:
+        for key, val in checkpoint.items():
+            if key == 'config':
+                continue
+            try:
+                thres = val['history'].history['val']['thresholds']
+                # thres = val['val']['thresholds']
+                thresholds.update({key: np.asarray(thres)[:, 1]})
+            except KeyError:
+                print('No optimized threshold found')
+                thresholds.update({key: 0.5})
+    else:
+        thresholds = 0.5
+    mode = 'pred' if args.train_file is True else 'test'
+    logger = _common(args, mode, thresholds=thresholds)
+
+    all_results = {}
+    # pdb.set_trace()
+    for layer, results in logger.items():
+        res = pd.concat([pd.DataFrame({'results': group['results'],
+                                      'videos': group['video_names']})
+                         for group in results['output']]).reset_index(drop=True)
+        all_results.update({layer: res})
+
+    df = pd.concat(all_results, axis=1)
+    df.to_pickle(os.path.join(args.load_model, args.save_dir + '.pkl'))
+    df.to_csv(os.path.join(args.load_model, args.save_dir + '.csv'), index=False)
     # read w/ header: pd.read_csv('models/bb/test-results.csv', header=[0,1])
 
 
 def _train(args, model, samples, set_size, meters, cross_history, roc=None, **kwargs):
 
-    train_samples, val_samples = samples
+    # train_samples, val_samples = samples
+    train_samples = samples.pop('train', None)
+    val_samples = samples.pop('val', None)
     for mode, size in set_size.items():
         if size == 0:
             continue
@@ -191,7 +234,7 @@ def _train(args, model, samples, set_size, meters, cross_history, roc=None, **kw
             cross_history.update(name, meter[-1], mode)
 
     if val_samples is not None:
-        measurements, thres_vals = _evaluate(
+        measurements, thres_vals, _ = _evaluate(
             model, (val_samples, set_size['val']), meters, mode='val',
             batch_size=args.batch_size, tune_threshold=True, roc=roc)
 
@@ -234,7 +277,7 @@ def _evaluate(model, data, meters, batch_size=32, verbose=1, mode='val',
     # Evaluate on VAL set (threshold @ 50%. @ `best_threshold`)
     meters_val = metrics.compose(meters.values(), (labels, probas_),
                                  threshold=thresholds)
-    # pdb.set_trace()
+
     if history:
         for name, measures in zip(meters.keys(), meters_val):
             history.update(
@@ -250,12 +293,15 @@ def _evaluate(model, data, meters, batch_size=32, verbose=1, mode='val',
         # utils.print_result(history.history[mode],
         #     '{}:: thresholds @ {}'.format(mode.upper(), thresholds), exclude=['thresholds'])
 
-    return {key: val for key, val in zip(meters.keys(), meters_val)}, thresholds
+    return {key: val for key, val in zip(meters.keys(), meters_val)},\
+        thresholds, {'probas': probas_, 'labels': labels}
 
 
 def train(args):
-
-    logger = _common(args, 'train', validation=args.val_roc)
+    aloi_file = args.aloi_file
+    val_ratio = args.val_ratio
+    logger = _common(args, 'train', validation=args.val_roc, aloi_file=aloi_file,
+                     val_ratio=val_ratio)
     for layer in logger.keys():
         logger[layer]['history'].averages(weights_key='nb_vids',
                                           exclude=['thresholds'])
@@ -397,16 +443,16 @@ if __name__ == '__main__':
         '--arch',
         '-a',
         metavar='ARCH',
-        # default='randomforest',
-        default='mlp',
+        default='randomforest',
+        # default='mlp',
         choices=arch_names,
         help='model architecture: ' + ' | '.join(arch_names) +
         ' (default: mlp)')
     parser.add_argument(
         '--arch-params',
         metavar='PARAMS',
-        # default=['nb_trees=100'],
-        default=['nb_neurons=[50, 1600]'],
+        default=['nb_trees=100', 'max_depth=12'],
+        # default=['nb_neurons=[50, 1600]'],
         nargs='+',
         type=str,
         help='model architecture params')
@@ -442,13 +488,25 @@ if __name__ == '__main__':
         help='weight decay (default: 0)')
     tr_parser.set_defaults(func=train)
 
+    # Eval parser
+    eval_parser = subparsers.add_parser('eval', help='Network training')
+    eval_parser.add_argument(
+        '--optim-thres',
+        action='store_true',
+        help='whether to evaluate data using optimized thresholds or 0.5')
+    eval_parser.set_defaults(func=eval)
+
     # Predict parser
-    pred_parser = subparsers.add_parser('eval', help='Network training')
+    pred_parser = subparsers.add_parser('predict', help='Network training')
     pred_parser.add_argument(
         '--optim-thres',
         action='store_true',
         help='whether to evaluate data using optimized thresholds or 0.5')
-    pred_parser.set_defaults(func=eval)
+    pred_parser.add_argument(
+        '--train-file',
+        action='store_true',
+        help='whether a file with the train file specs is being used')
+    pred_parser.set_defaults(func=predict)
 
     args = parser.parse_args()
     print(args)
