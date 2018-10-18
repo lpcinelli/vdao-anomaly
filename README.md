@@ -2,13 +2,15 @@
 This is code for the paper [Moving-camera Video Surveillance in Cluttered Environments using Deep Features](https://www.researchgate.net/publication/327995320_Moving-Camera_Video_Surveillance_in_Cluttered_Environments_Using_Deep_Features) by Bruno Afonso, Lucas Cinelli, Lucas Thomaz, Allan Silva, Eduardo Barros and Sergio Netto.
 
 ## VDAO dataset
-To download the ResNet50 features extracted from the VDAO dataset run:
+To download the ResNet50 features extracted from the [VDAO dataset](http://www02.smt.ufrj.br/%7Etvdigital/database/objects/page_01.html) run:
 
 ``` bash
 sh data/download_vdao.sh /path/to/data/
 ```
 
 This will download the dataset in hdf5 format into the specified directory.
+
+[This repository] (https://github.com/rafaelpadilla/DeepLearning-VDAO/tree/master/VDAO_Access) may be useful for handling VDAO 
 
 ## Requirements
 
