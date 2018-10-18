@@ -10,7 +10,7 @@ sh data/download_vdao.sh /path/to/data/
 
 This will download the dataset in hdf5 format into the specified directory.
 
-[This repository] (https://github.com/rafaelpadilla/DeepLearning-VDAO/tree/master/VDAO_Access) may be useful for handling VDAO 
+[This repository](https://github.com/rafaelpadilla/DeepLearning-VDAO/tree/master/VDAO_Access) may be useful for handling VDAO 
 
 ## Requirements
 
