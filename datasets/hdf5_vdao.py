@@ -135,28 +135,25 @@ class VDAO(object):
 
     def load_generator(self,
                        method='leave_one_out',
-                       inner_kwargs=None,
                        **kwargs):
-    """Generator over the folds created by the method chosen in `group_fetching`
+        """Generator over the folds created by the method chosen in `group_fetching`
 
-    Keyword Arguments:
-        method {str} -- Which method from `group_fetching` dict to use
-            (default: {'leave_one_out'})
-        inner_kwargs {dict} -- kwargs for the chosen method (default: {None})
+        Keyword Arguments:
+            method {str} -- Which method from `group_fetching` dict to use
+                (default: {'leave_one_out'})
 
-    Returns:
-        If self.mode is 'test'
-            tuple -- data and label pairs for the test set, name of test vids
-            dict -- size (value) of the test set (key)
-        Else
-            dict -- data and label pairs (value) of each returned set (key)
-            dict -- size (value) of each returned set (key)
-    """
+        Returns:
+            If self.mode is 'test'
+                tuple -- data and label pairs for the test set, name of test vids
+                dict -- size (value) of the test set (key)
+            Else
+                dict -- data and label pairs (value) of each returned set (key)
+                dict -- size (value) of each returned set (key)
+        """
         x = np.arange(len(self.VIDS_OBJS))
         fold_method = group_fetching[method](**kwargs)
-        mode = inner_kwargs.pop('mode', 'video')
 
-        if mode == 'aloi' and self.files['aloi'] is not None:
+        if self.files['aloi'] is not None:
             self.data['aloi'], aloi_size = _loadFile(
                 os.path.join(self.dataset_dir, self.files['aloi']),
                 self.out_layer, [''])
@@ -164,7 +161,7 @@ class VDAO(object):
         for train_vid_idx, test_vid_idx in fold_method.split(x, x, self.VIDS_OBJS):
             test_objs = [self.VIDS_OBJS[vid] for vid in test_vid_idx]
             test_vids = [['video{}'.format(vid+1)] for vid in test_vid_idx]
-            train_vids = list(product(VDAO_ILLU, set(
+            train_vids = list(product(self.VDAO_ILLU, set(
                 [self.VIDS_OBJS[idx] for idx in train_vid_idx]), self.VDAO_POS))
 
             if self.mode == 'test':
@@ -177,8 +174,7 @@ class VDAO(object):
                 self.data['val'], val_size = None, 0
                 if self.val_set is True:
                     train_vids, val_vids = self.split_validation(
-                        mode=mode, data=train_vids, groups=train_vid_idx,
-                        random_state=0, **inner_kwargs)
+                        data=train_vids, random_state=0)
 
                     self.data['val'], val_size, _  = _loadFile(
                         os.path.join(self.dataset_dir, self.files['train']),
@@ -191,80 +187,42 @@ class VDAO(object):
                 if self.val_set is True:
                     yield {'train': _merge_datasets(
                                     (self.data['train'], self.data['aloi'])),
-                           'val': self.data['val']},
+                           'val': self.data['val']}, \
                           {'train': train_size, 'val': val_size}
                 else:
                     yield {'train': _merge_datasets(
-                                    (self.data['train'], self.data['aloi']))},
+                                    (self.data['train'], self.data['aloi']))}, \
                           {'train': train_size}
 
     def split_validation(self,
-                         mode='frame',
                          ratio=None,
                          data=None,
                          labels=None,
-                         random_state=None,
-                         groups=None,
-                         **kwargs):
+                         random_state=None):
         """Split the training data into two separate disjoint sets: train and
-            val sets.
+            val sets. The separation is done on the entire videos. However,
+            the same obj may appear both in train and val sets.
 
         Keyword Arguments:
-            mode {str} -- Whether to split frames or whole videos (default: {'frame'})
-            ratio {[type]} -- [description] (default: {None})
-            data {[type]} -- [description] (default: {None})
-            labels {[type]} -- [description] (default: {None})
-            random_state {[type]} -- [description] (default: {None})
-            groups {[type]} -- [description] (default: {None})
-
-        Raises:
-            ValueError -- Invalid split mode chosen
+            ratio {int} -- [description] (default: {None})
+            data {nd.array} -- [description] (default: {None})
+            labels {nd.array} -- [description] (default: {None})
+            random_state {int} -- The seed for the pseudorandom generator (default: {None})
 
         Returns:
-            [type] -- [description]
+            lists -- List containing train-test split of inputs.
         """
-
-
         extra_data = None
         if ratio is None:
             ratio = self.val_ratio
 
-        if mode == 'frame':
-            if data is None:
-                data, labels = self.data['train']
-                extra_data = self.data['aloi']
+        if data is None:
+            data = np.asarray(self.train_entries)
 
-            x_train, x_val, y_train, y_val = train_test_split(
-                data, labels, stratify=labels, test_size=ratio, random_state=random_state)
-            train_data = x_train, y_train
-            return _merge_datasets((train_data, extra_data)), (x_val, y_val)
+        x_train, x_val, _, _ = train_test_split(
+            data, np.ones(len(data)), test_size=ratio, random_state=random_state)
 
-        if mode == 'video':
-            if data is None:
-                data = np.asarray(self.train_entries)
-
-            x_train, x_val, _, _ = train_test_split(
-                data, np.ones(len(data)), test_size=ratio, random_state=random_state)
-
-            if labels is None:
-                return x_train, x_val
-
-        try:
-            # If the user wants a more complex split method for the validation set,
-            # such as leaveOneOut, then it should specify the name of the method
-            # as defined in `sklearn.model_selection` class.
-            raise NotImplementedError
-            if data is None:
-                data = np.asarray(self.train_entries)
-
-            split_method = getattr(sklearn.model_selection, mode)
-            split_method = split_method(**kwargs)
-            train_index, val_index = next(
-                split_method.split(data, data, groups))
-            return data[train_index], data[val_index]
-
-        except AttributeError:
-            raise ValueError('invalid mode \'{}\' chosen'.format(mode))
+        return x_train, x_val
 
 
 def _merge_datasets(datasets):

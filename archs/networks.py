@@ -6,7 +6,6 @@ from keras.layers import Activation, Dense, Flatten
 from keras.models import Model, Sequential
 from keras.regularizers import l1, l2
 from keras.optimizers import SGD, Adam, Adamax
-from keras.utils import multi_gpu_model
 from keras import callbacks
 
 __all__ = ['mlp']
@@ -21,19 +20,16 @@ class MLP(object):
     def __init__(self, load_path=None, layer=None, group_idx=None,
                  input_shape=None, nb_neurons=None, weight_decay=0,
                  save_path=None):
-    """
-    Keyword Arguments:
-        load_path {str} -- The path from which to load the models (default: {None})
-        layer {str} -- The layer from which features were extracted (default: {None})
-        group_idx {int} -- The data fold being used  (default: {None})
-        input_shape {[type]} -- [description] (default: {None})
-        nb_neurons {[type]} -- [description] (default: {None})
-        weight_decay {int} -- [description] (default: {0})
-        save_path {str} -- The target dir where the model should be saved (default: {None})
-
-    Returns:
-        [type] -- [description]
-    """
+        """
+        Keyword Arguments:
+            load_path {str} -- The path from which to load the models (default: {None})
+            layer {str} -- The layer from which features were extracted (default: {None})
+            group_idx {int} -- The data fold being used  (default: {None})
+            input_shape {list} -- [description] (default: {None})
+            nb_neurons {int} -- [description] (default: {None})
+            weight_decay {int} -- [description] (default: {0})
+            save_path {str} -- The target dir where the model should be saved (default: {None})
+        """
         self.group_idx = group_idx
         self.subdir = os.path.join(save_path, layer)
         if load_path is not None:
@@ -116,14 +112,6 @@ class MLP(object):
             loss=loss,
             optimizer=optimizer,
             metrics=metrics)
-
-    def parallelize(self, multi_gpu):
-        if multi_gpu:
-            try:
-                self.model = multi_gpu_model(self.model)
-            except Exception as e:
-                print('Not possible to run on multiple GPUs\n'
-                      'Error: {}'.format(e))
 
     def fit(self, X, y, val_data=None):
         history = self.model.fit(x=X,

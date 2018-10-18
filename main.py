@@ -1,6 +1,4 @@
 import argparse
-import glob
-import json
 import os
 import pickle
 
@@ -9,17 +7,19 @@ mpl.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import tensorflow as tf
+
+from keras import backend as K
 
 import archs
 import datasets.hdf5_vdao as vdao
-import keras
 import metrics
-import tensorflow as tf
 import utils
 from archs.networks import optimizers
-from datasets.hdf5_vdao import VDAO.LAYER_NAME as LAYER_NAME
-from keras import backend as K
-from keras import callbacks
+from datasets.hdf5_vdao import VDAO
+
+np.random.seed(0)
+tf.set_random_seed(0)
 
 arch_names = sorted(name for name in archs.__dict__
                     if name.islower() and not name.startswith("__")
@@ -49,7 +49,7 @@ def _common(args, mode, validation=False, val_ratio=0, aloi_file=None, **kwargs)
 
     logger = {}
     # Apply func to data comming from all specified layers
-    for layer in LAYER_NAME:
+    for layer in VDAO.LAYER_NAME:
         print('layer: {}'.format(layer))
         database.set_layer(layer)
         cross_history = utils.History()
@@ -59,9 +59,7 @@ def _common(args, mode, validation=False, val_ratio=0, aloi_file=None, **kwargs)
 
         # Apply func to each partition of the data
         for group_idx, (samples, set_size) in enumerate(
-                database.load_generator(
-                    **utils.parse_kwparams(args.cv_params),
-                    inner_kwargs=utils.parse_kwparams(args.inner_val_params))):
+                database.load_generator(**utils.parse_kwparams(args.cv_params))):
 
             # Load old model or create a new one
             if args.load_model is not None:
@@ -155,8 +153,6 @@ def eval(args):
         res = pd.concat([pd.DataFrame(group['meters'])
                          for group in results['output']]).reset_index(drop=True)
         res = res.applymap(lambda x: x[0])
-        # res.to_csv(os.path.join(args.load_model, layer,
-        #                         args.save_dir), index=False)
         all_results.update({layer: res})
 
     pd.concat(all_results, axis=1).to_csv(
@@ -174,7 +170,6 @@ def predict(args):
                 continue
             try:
                 thres = val['history'].history['val']['thresholds']
-                # thres = val['val']['thresholds']
                 thresholds.update({key: np.asarray(thres)[:, 1]})
             except KeyError:
                 print('No optimized threshold found')
@@ -185,16 +180,16 @@ def predict(args):
     logger = _common(args, mode, thresholds=thresholds)
 
     all_results = {}
-    # pdb.set_trace()
     for layer, results in logger.items():
-        res = pd.concat([pd.DataFrame({'results': group['results'],
-                                      'videos': group['video_names']})
-                         for group in results['output']]).reset_index(drop=True)
+        res = pd.concat([pd.DataFrame(group['results'],
+                                      index=group['video_names']
+                                      )
+                         for group in results['output']])
         all_results.update({layer: res})
 
     df = pd.concat(all_results, axis=1)
     df.to_pickle(os.path.join(args.load_model, args.save_dir + '.pkl'))
-    df.to_csv(os.path.join(args.load_model, args.save_dir + '.csv'), index=False)
+    df.to_csv(os.path.join(args.load_model, args.save_dir + '.csv'), index=True)
     # read w/ header: pd.read_csv('models/bb/test-results.csv', header=[0,1])
 
 
@@ -221,7 +216,6 @@ def _train(args, model, samples, set_size, meters, cross_history, roc=None, **kw
                        metrics.TrueNeg(),
                        metrics.FalsePos(),
                        metrics.FalseNeg()])
-        model.parallelize(args.multi_gpu)
 
     # Train the model
     history = model.fit(X=train_samples[0], y=train_samples[1],
@@ -274,10 +268,10 @@ def _evaluate(model, data, meters, batch_size=32, verbose=1, mode='val',
     if tune_threshold:
         best_threshold, _ = roc(labels, probas_)
         thresholds = thresholds + [best_threshold]
+
     # Evaluate on VAL set (threshold @ 50%. @ `best_threshold`)
     meters_val = metrics.compose(meters.values(), (labels, probas_),
                                  threshold=thresholds)
-
     if history:
         for name, measures in zip(meters.keys(), meters_val):
             history.update(
@@ -367,11 +361,6 @@ if __name__ == '__main__':
         help='optimizers: ' + ' | '.join(sorted(optimizers.keys())) +
         ' (default: adamax)')
     parser.add_argument(
-        '--multi-gpu',
-        '--multiple-gpu',
-        action='store_true',
-        help='Run on several GPUs if available')
-    parser.add_argument(
         '--save',
         dest='save_dir',
         type=str,
@@ -421,38 +410,26 @@ if __name__ == '__main__':
     parser.add_argument(
         '--cv-params',
         metavar='PARAMS',
-        # default=['method=k_fold', 'n_splits=5'],
-        default=['method=leave_one_out'],
-        # default=['method=manual', 'filename=legacy/test_folds.json'],
-        # default=[],
+        default=[],
         nargs='+',
         type=str,
         help='cross validation params, methods: ' + ' | '.join(
             list(vdao.group_fetching.keys())) + ' (default method: leave_one_out)'
     )
-    parser.add_argument(
-        '--inner-val-params',
-        metavar='PARAMS',
-        default=['mode=video'],
-        nargs='+',
-        type=str,
-        help='inner validation params (default method: LeaveOneGroupOut)'
-    )
+
     # Architecture
     parser.add_argument(
         '--arch',
         '-a',
         metavar='ARCH',
-        default='randomforest',
-        # default='mlp',
+        default='mlp',
         choices=arch_names,
         help='model architecture: ' + ' | '.join(arch_names) +
         ' (default: mlp)')
     parser.add_argument(
         '--arch-params',
         metavar='PARAMS',
-        default=['nb_trees=100', 'max_depth=12'],
-        # default=['nb_neurons=[50, 1600]'],
+        default=[],
         nargs='+',
         type=str,
         help='model architecture params')
