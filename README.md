@@ -5,7 +5,7 @@ This is code for the paper [Moving-camera Video Surveillance in Cluttered Enviro
 To download the ResNet50 features extracted from the [VDAO dataset](http://www02.smt.ufrj.br/%7Etvdigital/database/objects/page_01.html) run:
 
 ``` bash
-sh data/download_vdao.sh /path/to/data/
+sh datasets/download_vdao.sh /path/to/data/
 ```
 
 This will download the dataset in hdf5 format into the specified directory.
